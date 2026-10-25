@@ -8,6 +8,7 @@ venv/
 # Runtime data, browser profiles and downloaded media
 .douyin_data/
 .douyin_runtime/
+.testtmp/
 抖音下载/
 *.part
 *.part.*

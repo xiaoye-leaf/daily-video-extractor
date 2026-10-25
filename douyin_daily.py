@@ -49,7 +49,7 @@ except Exception:
     messagebox = None
 
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 APP_TITLE = "日常视频提取器（抖音/快手/B站） v" + APP_VERSION
 
 
@@ -72,6 +72,16 @@ USER_PATH_RE = re.compile(r"/user/([A-Za-z0-9_\-]{12,})")
 BILIBILI_SPACE_RE = re.compile(
     r"(?:space\.bilibili\.com|m\.bilibili\.com/space)/(\d+)", re.I
 )
+BILIBILI_VIDEO_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
+BILIBILI_AV_RE = re.compile(r"(?<![0-9A-Za-z])av(\d{1,12})(?![0-9])", re.I)
+BILIBILI_SHORT_RE = re.compile(
+    r"(?:https?://)?(?:b23\.tv|bili2233\.cn)/([0-9A-Za-z]+)", re.I
+)
+BILIBILI_PAGE_RE = re.compile(r"[?&#]p=(\d{1,4})", re.I)
+BILIBILI_API_HEADERS = {
+    "Referer": "https://www.bilibili.com/",
+    "Origin": "https://www.bilibili.com",
+}
 KUAISHOU_PROFILE_RE = re.compile(
     r"(?:www\.)?kuaishou\.com/profile/([A-Za-z0-9_\-]+)", re.I
 )
@@ -96,10 +106,34 @@ LOGGER = logging.getLogger("douyin_daily")
 BROWSER_CAPTURE_DONE_GRACE = 0.25
 BROWSER_CAPTURE_STALL_SECONDS = 6.0
 BROWSER_CAPTURE_TIMEOUT = 120.0
+BROWSER_CAPTURE_BILIBILI_STALL_SECONDS = 18.0
+BROWSER_CAPTURE_BILIBILI_TIMEOUT = 240.0
+BROWSER_CAPTURE_BILIBILI_MANUAL_STALL_SECONDS = 35.0
 BROWSER_LAUNCH_ATTEMPTS = 3
 BROWSER_EXTENSION_READY_TIMEOUT = 8.0
 BROWSER_PAGE_BRIDGE_TIMEOUT = 12.0
 BROWSER_LAUNCH_QUIET_SECONDS = 0.6
+
+UI_FONT = "Microsoft YaHei UI"
+UI_MONO_FONT = "Consolas"
+UI_COLORS = {
+    "bg": "#f3f5f9",
+    "card": "#ffffff",
+    "border": "#e2e6ee",
+    "text": "#1f2329",
+    "muted": "#6b7280",
+    "faint": "#9aa1ad",
+    "header": "#1c1f2b",
+    "header_soft": "#2a2e3d",
+    "accent": "#fb7299",
+    "accent_hover": "#ff8aac",
+    "accent_soft": "#fdeef3",
+    "accent_text": "#d94f7c",
+    "green": "#18a058",
+    "red": "#d94a4a",
+    "amber": "#b7791f",
+    "stripe": "#fafbfd",
+}
 
 
 def platform_item_timestamp(platform: str, item: Any) -> int:
@@ -153,14 +187,16 @@ def browser_capture_decision(
     has_more: Optional[bool],
     idle_seconds: float,
     elapsed_seconds: float,
+    stall_seconds: float = BROWSER_CAPTURE_STALL_SECONDS,
+    timeout_seconds: float = BROWSER_CAPTURE_TIMEOUT,
 ) -> str:
     """Return done/stalled/timeout/waiting for the browser capture loop."""
     if items_count:
         if has_more is False and idle_seconds >= BROWSER_CAPTURE_DONE_GRACE:
             return "done"
-        if idle_seconds >= BROWSER_CAPTURE_STALL_SECONDS:
+        if idle_seconds >= stall_seconds:
             return "stalled"
-    if elapsed_seconds >= BROWSER_CAPTURE_TIMEOUT:
+    if elapsed_seconds >= timeout_seconds:
         return "timeout"
     return "waiting"
 
@@ -241,6 +277,85 @@ def extract_bilibili_mid(raw_value: str) -> str:
         return match.group(1)
     candidate = text.strip().strip("\"'")
     return candidate if candidate.isdigit() else ""
+
+
+BILIBILI_LINK_TOKEN_RE = re.compile(
+    r"https?://[^\s<>\"'，。；、）】》]+"
+    r"|(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?:\?[^\s<>\"'，。；、）】》]*)?"
+    r"|(?<![0-9A-Za-z])av\d{1,12}(?![0-9])(?:\?[^\s<>\"'，。；、）】》]*)?"
+    r"|(?:https?://)?(?:b23\.tv|bili2233\.cn)/[0-9A-Za-z]+(?:\?[^\s<>\"'，。；、）】》]*)?",
+    re.I,
+)
+
+
+def parse_bilibili_video_links(raw_text: str) -> list["BilibiliVideoRef"]:
+    """Split pasted text into Bilibili video links.
+
+    Accepts BV ids, av ids, full video URLs and b23.tv / bili2233.cn short
+    links.  A ``?p=N`` query keeps only that part; otherwise every part is
+    used when the caller asks for it.
+    """
+    text = str(raw_text or "")
+    if not text.strip():
+        return []
+    refs: list[BilibiliVideoRef] = []
+    seen: set[str] = set()
+
+    def add(ref: BilibiliVideoRef) -> None:
+        key = ref.key
+        if not key or key in seen:
+            return
+        seen.add(key)
+        refs.append(ref)
+
+    for match in BILIBILI_LINK_TOKEN_RE.finditer(text):
+        token = match.group(0).strip().strip("\"'<>()[]{}，。；、）】》")
+        if not token:
+            continue
+        if token.lower().startswith("http"):
+            try:
+                host = urllib.parse.urlsplit(token).netloc.lower()
+            except ValueError:
+                continue
+            if not (
+                host == "bilibili.com"
+                or host.endswith(".bilibili.com")
+                or host == "b23.tv"
+                or host.endswith(".b23.tv")
+                or host == "bili2233.cn"
+                or host.endswith(".bili2233.cn")
+            ):
+                continue
+        page_match = BILIBILI_PAGE_RE.search(token)
+        page = _to_int(page_match.group(1), 0) if page_match else 0
+        short = BILIBILI_SHORT_RE.search(token)
+        if short and "bilibili.com/video/" not in token.lower():
+            code = short.group(1)
+            add(BilibiliVideoRef(
+                url=f"https://b23.tv/{code}",
+                page=page,
+                short_url=True,
+                raw=token,
+            ))
+            continue
+        bv = BILIBILI_VIDEO_RE.search(token)
+        if bv:
+            add(BilibiliVideoRef(
+                url=token if token.lower().startswith("http") else "",
+                bvid=bv.group(1),
+                page=page,
+                raw=token,
+            ))
+            continue
+        av = BILIBILI_AV_RE.search(token)
+        if av:
+            add(BilibiliVideoRef(
+                url=token if token.lower().startswith("http") else "",
+                aid=av.group(1),
+                page=page,
+                raw=token,
+            ))
+    return refs
 
 
 def extract_kuaishou_user_id(raw_value: str) -> str:
@@ -1159,7 +1274,9 @@ class BrowserBridgeServer:
             )
 
 
-def create_browser_bridge_extension(port: int) -> Path:
+def create_browser_bridge_extension(
+    port: int, bilibili_auto_page: bool = True
+) -> Path:
     runtime_dir = APP_BASE_DIR / ".douyin_runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     extension_dir = Path(tempfile.mkdtemp(
@@ -1173,7 +1290,7 @@ def create_browser_bridge_extension(port: int) -> Path:
     manifest = {
         "manifest_version": 3,
         "name": "Local Media Bridge",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "description": "Local helper for Douyin, Kuaishou and Bilibili extraction",
         "permissions": ["cookies"],
         "host_permissions": [
@@ -1262,6 +1379,7 @@ setInterval(sendCookies, 3000);
   if (window.__dyBridgeInstalled) return;
   window.__dyBridgeInstalled = true;
 
+  const BILI_AUTO_PAGE = __BILI_AUTO_PAGE__;
   let scrollTimer = 0;
   let stopped = false;
   let ticks = 0;
@@ -1269,6 +1387,11 @@ setInterval(sendCookies, 3000);
   let lastApiAt = Date.now();
   let scrollTargets = [];
   let lastTargetScan = 0;
+  let biliTimer = 0;
+  let biliClickAttempts = 0;
+  let biliLastClickAt = 0;
+  let biliHasMore = false;
+  let biliLastPn = 0;
 
   const report = (data, api = "", platform = "") => {
     try {
@@ -1418,6 +1541,10 @@ setInterval(sendCookies, 3000);
       clearTimeout(scrollTimer);
       scrollTimer = 0;
     }
+    if (biliTimer) {
+      clearTimeout(biliTimer);
+      biliTimer = 0;
+    }
   };
 
   const findScrollTargets = () => {
@@ -1496,13 +1623,155 @@ setInterval(sendCookies, 3000);
     scrollTimer = setTimeout(scrollNow, delay);
   };
 
+  const biliVisible = (node) => {
+    if (!node || node.disabled) return false;
+    if (String(node.getAttribute("aria-disabled") || "") === "true") return false;
+    try {
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+    } catch (error) {}
+    return true;
+  };
+
+  const biliCurrentPage = () => {
+    try {
+      const active = document.querySelector(
+        '.vui_pagenation--btn-num[aria-current="page"], '
+        + '.vui_pagenation--btn[aria-current="page"]'
+      );
+      if (active) {
+        const value = parseInt(String(active.textContent || "").trim(), 10);
+        if (Number.isFinite(value) && value > 0) return value;
+      }
+      const current = document.querySelector(
+        '[aria-label*="当前页"], .vui_pagenation--btn.active'
+      );
+      if (current) {
+        const match = String(
+          current.getAttribute("aria-label") || current.textContent || ""
+        ).match(/(\d+)/);
+        if (match) return parseInt(match[1], 10);
+      }
+    } catch (error) {}
+    return 0;
+  };
+
+  const findBiliNextButton = () => {
+    const selectors = [
+      'button[aria-label="下一页"]',
+      '[role="button"][aria-label="下一页"]',
+      '.vui_pagenation--btn-side[aria-label="下一页"]',
+      'button[title="下一页"]',
+    ];
+    for (const selector of selectors) {
+      try {
+        for (const node of document.querySelectorAll(selector)) {
+          if (biliVisible(node)) return node;
+        }
+      } catch (error) {}
+    }
+    // Fresh-space renders the pager through VBtn: aria-label="下一页".
+    let candidates = [];
+    try {
+      candidates = Array.from(document.querySelectorAll(
+        '.vui_pagenation button, [class*="pagenation"] button, '
+        + '[class*="pagination"] button, nav button'
+      ));
+    } catch (error) {}
+    for (const node of candidates) {
+      const label = (
+        String(node.getAttribute("aria-label") || "")
+        + " " + String(node.textContent || "")
+      ).replace(/\s+/g, " ").trim();
+      if (label.includes("下一页") || label.toLowerCase() === "next") {
+        if (biliVisible(node)) return node;
+      }
+    }
+    // Last resort: the next arrow is the last side button of the pager.
+    let sides = [];
+    try {
+      sides = Array.from(document.querySelectorAll('.vui_pagenation--btn-side'));
+    } catch (error) {}
+    for (let index = sides.length - 1; index >= 0; index -= 1) {
+      const node = sides[index];
+      const label = String(node.getAttribute("aria-label") || "");
+      if (label && !label.includes("下一页")) continue;
+      if (biliVisible(node)) return node;
+    }
+    return null;
+  };
+
+  const scheduleBiliNext = (delay) => {
+    if (!BILI_AUTO_PAGE || stopped) return;
+    if (biliTimer) clearTimeout(biliTimer);
+    biliTimer = setTimeout(clickBiliNext, delay);
+  };
+
+  const clickBiliNext = () => {
+    biliTimer = 0;
+    if (stopped || !BILI_AUTO_PAGE) return;
+    const button = findBiliNextButton();
+    if (!button) {
+      biliClickAttempts += 1;
+      if (biliClickAttempts <= 20) {
+        biliTimer = setTimeout(clickBiliNext, 700);
+      }
+      return;
+    }
+    const now = Date.now();
+    if (now - biliLastClickAt < 1400) {
+      biliTimer = setTimeout(clickBiliNext, 500);
+      return;
+    }
+    const pageBefore = biliCurrentPage();
+    const apiBefore = lastApiAt;
+    biliLastClickAt = now;
+    biliClickAttempts += 1;
+    try {
+      button.scrollIntoView({block: "center"});
+      button.click();
+    } catch (error) {}
+    // The pager disables itself while loading. If no new API response
+    // arrives, click once more instead of waiting for the capture timeout.
+    biliTimer = setTimeout(() => {
+      biliTimer = 0;
+      if (stopped || !BILI_AUTO_PAGE) return;
+      if (lastApiAt !== apiBefore) return;
+      const pageNow = biliCurrentPage();
+      if (pageBefore && pageNow && pageNow !== pageBefore) return;
+      if (biliClickAttempts > 80) return;
+      clickBiliNext();
+    }, 4200);
+  };
+
   const capturePayload = (data, url, platform) => {
     if (!data || typeof data !== "object") return;
     lastApiAt = Date.now();
     report(data, url, platform);
     const more = readHasMore(data, platform);
     if (more === false) {
+      biliHasMore = false;
       stopScrolling();
+    } else if (platform === "bilibili") {
+      biliHasMore = more === true;
+      let freshPage = true;
+      try {
+        const page = findBilibiliPage(data);
+        const pn = page ? Number(page.pn) : NaN;
+        if (Number.isFinite(pn) && pn > 0) {
+          if (pn === biliLastPn) freshPage = false;
+          else biliLastPn = pn;
+        }
+      } catch (error) {}
+      if (more === true && freshPage) {
+        // Bilibili space pages use explicit pagination, so scrolling alone
+        // never loads page 2. Click its 下一页 button automatically.
+        biliClickAttempts = 0;
+        scheduleBiliNext(260);
+        // Old/infinite-scroll space layouts still need a scroll nudge.
+        lastHeight = 0;
+        nudgeScroll(900);
+      }
     } else if (more === true) {
       lastHeight = 0;
       nudgeScroll(20);
@@ -1550,14 +1819,27 @@ setInterval(sendCookies, 3000);
   });
 
   report({__dyReady: true});
-  window.addEventListener("focus", () => nudgeScroll(20));
+  const kickCapture = () => {
+    if (biliHasMore) {
+      scheduleBiliNext(250);
+    } else {
+      nudgeScroll(20);
+    }
+  };
+  window.addEventListener("focus", kickCapture);
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) nudgeScroll(20);
+    if (!document.hidden) kickCapture();
   });
   setTimeout(() => nudgeScroll(0), 180);
 })();
 '''
-    (extension_dir / "inject.js").write_text(inject, encoding="utf-8")
+    (extension_dir / "inject.js").write_text(
+        inject.replace(
+            "__BILI_AUTO_PAGE__",
+            "true" if bilibili_auto_page else "false",
+        ),
+        encoding="utf-8",
+    )
     bridge = '''const DY_BRIDGE_PORT = __PORT__;
 let commandPollStopped = false;
 const askForCookies = () => {
@@ -1743,6 +2025,8 @@ class VideoMeta:
     media_type: str = "video"
     image_items: list[dict] = field(default_factory=list)
     platform: str = "douyin"
+    cid: str = ""
+    page_index: int = 0
 
     @property
     def create_datetime(self) -> datetime:
@@ -1788,7 +2072,45 @@ class VideoMeta:
             "share_url": self.share_fallback(),
             "media_type": self.media_type,
             "image_items": list(self.image_items),
+            "cid": self.cid,
+            "page_index": self.page_index,
         }
+
+
+@dataclass
+class BilibiliVideoRef:
+    """One parsed Bilibili video link, before it is resolved through the API."""
+
+    url: str = ""
+    bvid: str = ""
+    aid: str = ""
+    page: int = 0
+    short_url: bool = False
+    raw: str = ""
+
+    @property
+    def page_number(self) -> int:
+        return self.page if self.page > 0 else 1
+
+    @property
+    def page_specified(self) -> bool:
+        return self.page > 0
+
+    @property
+    def label(self) -> str:
+        if self.bvid:
+            base = self.bvid
+        elif self.aid:
+            base = f"av{self.aid}"
+        else:
+            base = self.url or self.raw or "短链接"
+        if self.page > 1:
+            return f"{base} P{self.page}"
+        return base
+
+    @property
+    def key(self) -> str:
+        return f"{self.bvid or ('av' + self.aid) or self.url}|{self.page_number}"
 
 
 class HttpClient:
@@ -1905,9 +2227,9 @@ class HttpClient:
         response = self.request(url, headers=headers)
         text = response.text.strip().lstrip("\ufeff")
         if not text:
-            raise DouyinError("抖音返回了空响应，可能触发了风控。")
+            raise DouyinError("接口返回了空响应，可能触发了风控。")
         if text.startswith("<"):
-            raise DouyinError("抖音返回了网页而不是数据，可能触发了安全验证。")
+            raise DouyinError("接口返回了网页而不是数据，可能触发了安全验证。")
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
@@ -1921,7 +2243,7 @@ class HttpClient:
                         continue
             if data is None:
                 raise DouyinError(
-                    "无法解析抖音返回的数据，接口可能已变化或被风控。"
+                    "无法解析接口返回的数据，接口可能已变化或被风控。"
                 )
         if isinstance(data, dict):
             status_code = _to_int(data.get("status_code"), 0)
@@ -2012,8 +2334,24 @@ class DouyinClient:
         self.http = HttpClient(
             cookie=cookie, delay=delay, cancel_event=cancel_event
         )
+        self.cancel_event = cancel_event
         self.last_browser_cookie = ""
         self.last_browser_user_agent = ""
+
+    def _cancelled(self) -> bool:
+        event = self.cancel_event
+        return bool(event and event.is_set())
+
+    @staticmethod
+    def _notify_log(
+        on_log: Optional[Callable[[str], None]], message: str
+    ) -> None:
+        if not on_log:
+            return
+        try:
+            on_log(message)
+        except Exception:
+            pass
 
     @staticmethod
     def _extract_sec_uid(text: str) -> str:
@@ -2376,6 +2714,255 @@ class DouyinClient:
                 )
         return result
 
+    def _bilibili_view(self, bvid: str = "", aid: str = "") -> dict:
+        query = {"bvid": bvid} if bvid else {"aid": str(aid)}
+        view = self.http.json_request(
+            "https://api.bilibili.com/x/web-interface/view?"
+            + urllib.parse.urlencode(query),
+            headers=dict(BILIBILI_API_HEADERS),
+        )
+        if not isinstance(view, dict):
+            raise DouyinError("B站视频信息返回异常，请稍后重试。")
+        code = _to_int(view.get("code"), 0)
+        if code != 0:
+            message = str(view.get("message") or "").strip()
+            known = {
+                -404: "视频不存在或已删除",
+                -403: "没有访问权限",
+                -10403: "该视频在当前地区不可用",
+                62002: "稿件不可见",
+                62004: "稿件正在审核中",
+                62012: "仅UP主自己可见",
+            }
+            reason = known.get(code) or message or f"错误码 {code}"
+            raise DouyinError(f"B站视频信息读取失败：{reason}")
+        data = view.get("data")
+        if not isinstance(data, dict):
+            raise DouyinError("B站视频信息为空，可能触发了风控。")
+        return data
+
+    @staticmethod
+    def _bilibili_video_from_data(
+        data: dict,
+        part: dict,
+        multi_part: bool,
+        ref: "BilibiliVideoRef",
+        split_all: bool,
+    ) -> VideoMeta:
+        bvid = str(data.get("bvid") or ref.bvid or "").strip()
+        aid = str(data.get("aid") or ref.aid or "").strip()
+        base_id = bvid or (f"av{aid}" if aid else "")
+        if not base_id:
+            raise DouyinError("B站视频缺少 BV/av 编号。")
+        page_no = max(1, _to_int(part.get("page"), 1))
+        part_title = html_lib.unescape(
+            str(part.get("part") or "").strip()
+        )
+        title = html_lib.unescape(
+            str(data.get("title") or "").strip()
+        ) or "(无标题)"
+        desc = title
+        if page_no > 1 or (multi_part and split_all):
+            desc = f"{title} P{page_no}"
+            if part_title and part_title != title:
+                desc += f" {part_title}"
+        created = _to_int(
+            data.get("pubdate") or data.get("ctime"), 0
+        ) or int(time.time())
+        owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+        stat = data.get("stat") if isinstance(data.get("stat"), dict) else {}
+        duration = _to_int(part.get("duration"), 0)
+        if duration <= 0:
+            duration = _to_int(data.get("duration"), 0)
+        cid = str(part.get("cid") or "").strip()
+        cover = _clean_video_url(str(data.get("pic") or ""))
+        aweme_id = base_id if page_no <= 1 else f"{base_id}_p{page_no}"
+        share_url = f"https://www.bilibili.com/video/{base_id}"
+        if page_no > 1:
+            share_url += f"?p={page_no}"
+        return VideoMeta(
+            aweme_id=aweme_id,
+            desc=desc,
+            create_time=created,
+            author=str(owner.get("name") or ""),
+            author_id=str(owner.get("mid") or ""),
+            play_urls=[],
+            cover_url=cover,
+            duration_ms=max(0, duration) * 1000,
+            stats={
+                "play_count": _to_int(stat.get("view"), 0),
+                "comment_count": _to_int(stat.get("reply"), 0),
+                "danmaku_count": _to_int(stat.get("danmaku"), 0),
+                "favorite_count": _to_int(stat.get("favorite"), 0),
+                "coin_count": _to_int(stat.get("coin"), 0),
+                "share_count": _to_int(stat.get("share"), 0),
+                "like_count": _to_int(stat.get("like"), 0),
+            },
+            share_url=share_url,
+            media_type="video",
+            platform="bilibili",
+            cid=cid,
+            page_index=page_no,
+        )
+
+    def resolve_bilibili_video_link(
+        self,
+        ref: "BilibiliVideoRef",
+        split_parts: bool = False,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> list[VideoMeta]:
+        """Resolve one pasted Bilibili link into one or more VideoMeta."""
+        if ref.short_url or not (ref.bvid or ref.aid):
+            if not ref.url:
+                raise DouyinError(f"无法识别的B站链接：{ref.raw or ref.label}")
+            try:
+                response = self.http.request(
+                    ref.url, headers=dict(BILIBILI_API_HEADERS)
+                )
+            except DouyinError as exc:
+                raise DouyinError(
+                    "B站短链接解析失败：" + exc.message.split("。")[0]
+                ) from exc
+            final_url = str(response.final_url or ref.url)
+            parsed = parse_bilibili_video_links(final_url)
+            if not parsed:
+                match = BILIBILI_VIDEO_RE.search(response.text)
+                if match:
+                    parsed = [BilibiliVideoRef(bvid=match.group(1))]
+            if not parsed:
+                raise DouyinError(
+                    f"短链接没有跳转到视频页：{ref.raw or ref.url}"
+                )
+            target = parsed[0]
+            if ref.page and not target.page:
+                target.page = ref.page
+            if on_log:
+                self._notify_log(
+                    on_log, f"  短链接已解析 → {target.label}"
+                )
+            ref = target
+
+        data = self._bilibili_view(ref.bvid, ref.aid)
+        raw_pages = data.get("pages")
+        pages = [
+            page for page in (raw_pages or [])
+            if isinstance(page, dict) and _to_int(page.get("cid"), 0)
+        ]
+        if not pages:
+            raise DouyinError("B站视频缺少分P信息，无法提取播放地址。")
+        pages.sort(key=lambda page: _to_int(page.get("page"), 1))
+        if ref.page_specified:
+            requested = ref.page_number
+            selected = [
+                page for page in pages
+                if _to_int(page.get("page"), 0) == requested
+            ]
+            if not selected:
+                raise DouyinError(
+                    f"该视频只有 {len(pages)} 个分P，找不到 P{requested}。"
+                )
+            if len(pages) > 1 and on_log:
+                self._notify_log(
+                    on_log, f"  已选择 P{requested} / 共 {len(pages)}P。"
+                )
+        elif split_parts and len(pages) > 1:
+            selected = pages
+            if on_log:
+                self._notify_log(
+                    on_log, f"  多P视频，将提取全部 {len(pages)} 个分P。"
+                )
+        else:
+            selected = pages[:1]
+            if len(pages) > 1 and on_log:
+                self._notify_log(
+                    on_log,
+                    f"  该视频有 {len(pages)} 个分P，默认只提取 P1；"
+                    "可勾选“多P视频提取全部分P”或使用 ?p=N 指定。",
+                )
+        return [
+            self._bilibili_video_from_data(
+                data, page, len(pages) > 1, ref,
+                split_all=bool(split_parts),
+            )
+            for page in selected
+        ]
+
+    def fetch_bilibili_videos_by_links(
+        self,
+        raw_text: str,
+        split_parts: bool = False,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> tuple[UserProfile, list[VideoMeta]]:
+        """Resolve a batch of pasted Bilibili video links.
+
+        This path never needs a browser: it uses the public view API, so a
+        single video can be fetched even when the author's space page is
+        paginated or the uploader list is incomplete.
+        """
+        refs = parse_bilibili_video_links(raw_text)
+        if not refs:
+            raise DouyinError(
+                "没有识别到B站视频链接。请粘贴 BV 号、av 号、"
+                "视频页链接或 b23.tv 短链，每行一个。"
+            )
+        if len(refs) > 200:
+            refs = refs[:200]
+            self._notify_log(on_log, "一次最多解析 200 个链接，已截取前 200 个。")
+        self._notify_log(
+            on_log,
+            f"识别到 {len(refs)} 个B站视频链接，开始解析…",
+        )
+        videos: list[VideoMeta] = []
+        seen: set[str] = set()
+        failures: list[tuple[str, str]] = []
+        for index, ref in enumerate(refs, start=1):
+            if self._cancelled():
+                raise CancelledError("操作已取消")
+            self._notify_log(
+                on_log, f"[{index}/{len(refs)}] 正在解析 {ref.label} …"
+            )
+            try:
+                items = self.resolve_bilibili_video_link(
+                    ref, split_parts=split_parts, on_log=on_log
+                )
+            except CancelledError:
+                raise
+            except DouyinError as exc:
+                failures.append((ref.label, exc.message))
+                self._notify_log(
+                    on_log, f"  ✗ {ref.label}：{exc.message}"
+                )
+                continue
+            added = 0
+            for video in items:
+                if video.aweme_id in seen:
+                    continue
+                seen.add(video.aweme_id)
+                videos.append(video)
+                added += 1
+            if added:
+                first = items[0]
+                self._notify_log(
+                    on_log,
+                    f"  ✓ {first.desc[:56]}"
+                    f"（{added} 条{'，作者：' + first.author if first.author else ''}）",
+                )
+        if not videos:
+            reason = failures[0][1] if failures else "没有解析到视频。"
+            raise DouyinError(reason)
+        if failures:
+            self._notify_log(
+                on_log,
+                f"有 {len(failures)} 个链接解析失败，已跳过；"
+                "详情见上方日志。",
+            )
+        videos.sort(key=lambda video: video.create_time, reverse=True)
+        user = UserProfile(sec_uid="bilibili", nickname="B站视频链接")
+        self._notify_log(
+            on_log, f"链接解析完成，共 {len(videos)} 条视频。"
+        )
+        return user, videos
+
     @staticmethod
     def parse_bilibili_item(item: Any) -> Optional[VideoMeta]:
         if not isinstance(item, dict):
@@ -2687,6 +3274,7 @@ class DouyinClient:
         browser_install: Optional[dict] = None,
         restart_browser: bool = False,
         platform_choice: str = "auto",
+        bilibili_auto_page: bool = True,
     ) -> tuple[UserProfile, list[VideoMeta]]:
         """Read a user's posts through the real Edge/Chrome login.
 
@@ -2758,7 +3346,9 @@ class DouyinClient:
 
         bridge = BrowserBridgeServer()
         bridge.start()
-        extension_dir = create_browser_bridge_extension(bridge.port)
+        extension_dir = create_browser_bridge_extension(
+            bridge.port, bilibili_auto_page=bilibili_auto_page
+        )
         def log(message: str) -> None:
             if on_log:
                 try:
@@ -2893,23 +3483,64 @@ class DouyinClient:
         started = time.monotonic()
         last_log = started
         early_stopped = False
+        last_page_seen = 0
+        if platform == "bilibili":
+            if bilibili_auto_page:
+                stall_seconds = BROWSER_CAPTURE_BILIBILI_STALL_SECONDS
+            else:
+                stall_seconds = BROWSER_CAPTURE_BILIBILI_MANUAL_STALL_SECONDS
+            timeout_seconds = BROWSER_CAPTURE_BILIBILI_TIMEOUT
+        else:
+            stall_seconds = BROWSER_CAPTURE_STALL_SECONDS
+            timeout_seconds = BROWSER_CAPTURE_TIMEOUT
         try:
             while True:
                 if self.http._cancelled():
                     raise CancelledError("操作已取消")
                 progress = bridge.progress_snapshot()
+                if (
+                    platform == "bilibili"
+                    and max_pages > 0
+                    and progress["api_pages"] >= max_pages
+                ):
+                    log(
+                        f"已达到最大读取页数 {max_pages}，停止自动翻页。"
+                    )
+                    bridge.request_stop_scroll()
+                    break
                 decision = browser_capture_decision(
                     progress["items"],
                     progress["has_more"],
                     progress["idle_seconds"],
                     progress["elapsed_seconds"],
+                    stall_seconds=stall_seconds,
+                    timeout_seconds=timeout_seconds,
                 )
                 if decision in ("done", "stalled", "timeout"):
                     if decision == "timeout":
                         log("读取等待超时，将使用已经捕获到的作品。")
+                    elif decision == "stalled" and platform == "bilibili":
+                        if bilibili_auto_page:
+                            log(
+                                "B站自动翻页已经停止；如果作品不完整，"
+                                "可以在浏览器中手动翻页后再点一次获取。"
+                            )
+                        else:
+                            log("等待B站页面翻页超时，将使用已读取的作品。")
                     if decision != "done":
                         bridge.request_stop_scroll()
                     break
+                if (
+                    platform == "bilibili"
+                    and progress["api_pages"] > last_page_seen
+                ):
+                    last_page_seen = progress["api_pages"]
+                    if last_page_seen > 1:
+                        log(
+                            f"已{'自动' if bilibili_auto_page else ''}翻到"
+                            f"第 {last_page_seen} 页，"
+                            f"累计 {progress['items']} 条作品。"
+                        )
                 if begin and progress["items"]:
                     latest_page = bridge.last_page_snapshot()
                     if browser_capture_reached_start(
@@ -2965,6 +3596,11 @@ class DouyinClient:
         packets = bridge.packets_snapshot()
         self.last_browser_cookie = build_cookie_header(cookies, platform)
         if not items:
+            if platform == "bilibili":
+                raise DouyinError(
+                    "本次没有读取到B站作品。请确认浏览器中的B站空间页可以正常显示、"
+                    "已登录并完成验证；单个视频也可以切换到“视频链接”标签页直接提取。"
+                )
             raise DouyinError(
                 f"本次没有读取到{label}作品。请在打开的浏览器中确认已登录、"
                 f"{label}用户主页可以正常显示，然后重新点击获取作品。"
@@ -3326,27 +3962,40 @@ class Downloader:
         aweme_id = str(video.aweme_id or "").strip()
         if not aweme_id:
             return []
+        base_id = re.sub(r"_p\d+$", "", aweme_id, flags=re.I)
         query = (
-            {"aid": aweme_id[2:]}
-            if aweme_id.lower().startswith("av") and aweme_id[2:].isdigit()
-            else {"bvid": aweme_id}
+            {"aid": base_id[2:]}
+            if base_id.lower().startswith("av") and base_id[2:].isdigit()
+            else {"bvid": base_id}
         )
-        headers = {"Referer": PLATFORM_REFERERS["bilibili"]}
-        view = self.client.json_request(
-            "https://api.bilibili.com/x/web-interface/view?"
-            + urllib.parse.urlencode(query),
-            headers=headers,
-        )
-        if not isinstance(view, dict) or _to_int(view.get("code"), 0) != 0:
-            message = view.get("message") if isinstance(view, dict) else ""
-            raise DouyinError(
-                "B站视频信息读取失败" + (f"：{message}" if message else "。")
-            )
-        data = view.get("data") if isinstance(view.get("data"), dict) else {}
-        pages = data.get("pages") if isinstance(data.get("pages"), list) else []
-        cid = _to_int(pages[0].get("cid"), 0) if pages and isinstance(pages[0], dict) else 0
+        headers = dict(BILIBILI_API_HEADERS)
+        cid = _to_int(video.cid, 0)
         if not cid:
-            raise DouyinError("B站视频缺少分P信息，无法解析下载地址。")
+            view = self.client.json_request(
+                "https://api.bilibili.com/x/web-interface/view?"
+                + urllib.parse.urlencode(query),
+                headers=headers,
+            )
+            if not isinstance(view, dict) or _to_int(view.get("code"), 0) != 0:
+                message = view.get("message") if isinstance(view, dict) else ""
+                raise DouyinError(
+                    "B站视频信息读取失败" + (f"：{message}" if message else "。")
+                )
+            data = view.get("data") if isinstance(view.get("data"), dict) else {}
+            pages = (
+                data.get("pages") if isinstance(data.get("pages"), list) else []
+            )
+            page_index = max(1, _to_int(video.page_index, 1))
+            selected = None
+            if 0 < page_index <= len(pages):
+                candidate = pages[page_index - 1]
+                if isinstance(candidate, dict):
+                    selected = candidate
+            if selected is None and pages and isinstance(pages[0], dict):
+                selected = pages[0]
+            cid = _to_int(selected.get("cid"), 0) if selected else 0
+            if not cid:
+                raise DouyinError("B站视频缺少分P信息，无法解析下载地址。")
         play_query = urllib.parse.urlencode({
             **query,
             "cid": cid,
@@ -3513,155 +4162,693 @@ class DouyinApp:
         self._destroyed = False
         self._close_deadline = 0.0
         self.root.title(APP_TITLE)
-        self.root.minsize(900, 620)
-        try:
-            self.root.geometry(self.settings.get("window_geometry") or "1080x760")
-        except Exception:
-            self.root.geometry("1080x760")
+        self._restore_geometry()
+        self.root.minsize(
+            min(1100, max(900, self.root.winfo_screenwidth() - 20)),
+            min(760, max(620, self.root.winfo_screenheight() - 60)),
+        )
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._setup_theme()
         self._build_ui()
         self.root.after(100, self._poll_events)
         self._log(
-            f"应用已启动 v{APP_VERSION}。支持抖音 / 快手 / B站；浏览器模式会直接使用本机 Edge/Chrome 的登录状态。"
+            f"应用已启动 v{APP_VERSION}。支持抖音 / 快手 / B站；"
+            "B站已支持自动翻页，也可以切到“视频链接”直接提取单个视频。"
+        )
+
+    def _restore_geometry(self) -> None:
+        """Restore a window size that always fits the current screen."""
+        screen_w = max(1024, self.root.winfo_screenwidth())
+        screen_h = max(720, self.root.winfo_screenheight())
+        width = min(1180, screen_w - 80)
+        height = min(900, screen_h - 90)
+        saved = str(self.settings.get("window_geometry") or "")
+        match = re.search(r"(\d+)x(\d+)", saved)
+        if match:
+            saved_w = int(match.group(1))
+            saved_h = int(match.group(2))
+            if (
+                1000 <= saved_w <= screen_w - 50
+                and 700 <= saved_h <= screen_h - 70
+            ):
+                width, height = saved_w, saved_h
+        width = max(1000, min(width, screen_w - 20))
+        height = max(700, min(height, screen_h - 70))
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 2 - 10)
+        pos = re.search(r"([+-]\d+)([+-]\d+)$", saved)
+        if pos:
+            try:
+                saved_x = int(pos.group(1))
+                saved_y = int(pos.group(2))
+                if 0 <= saved_x <= screen_w - width:
+                    x = saved_x
+                if 0 <= saved_y <= screen_h - height - 30:
+                    y = saved_y
+            except ValueError:
+                pass
+        try:
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            self.root.geometry("1180x900")
+
+    def _setup_theme(self) -> None:
+        """Style ttk widgets with a light card layout and Bilibili-pink accent."""
+        self.style = ttk.Style(self.root)
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+        c = UI_COLORS
+        font = (UI_FONT, 10)
+        font_bold = (UI_FONT, 10, "bold")
+        self.root.configure(bg=c["bg"])
+        try:
+            self.root.option_add("*Font", font)
+            self.root.option_add("*TearOff", False)
+        except Exception:
+            pass
+        self.style.configure(".", font=font)
+        self.style.configure("TFrame", background=c["bg"])
+        self.style.configure("Card.TFrame", background=c["card"])
+        self.style.configure("Header.TFrame", background=c["header"])
+        self.style.configure("AccentLine.TFrame", background=c["accent"])
+        self.style.configure(
+            "TLabel", background=c["bg"], foreground=c["text"], font=font
+        )
+        self.style.configure(
+            "Card.TLabel", background=c["card"], foreground=c["text"], font=font
+        )
+        self.style.configure(
+            "Muted.TLabel", background=c["card"], foreground=c["muted"],
+            font=(UI_FONT, 9),
+        )
+        self.style.configure(
+            "Hint.TLabel", background=c["bg"], foreground=c["muted"],
+            font=(UI_FONT, 9),
+        )
+        self.style.configure(
+            "Section.TLabel", background=c["card"], foreground=c["text"],
+            font=(UI_FONT, 11, "bold"),
+        )
+        self.style.configure(
+            "DialogTitle.TLabel", background=c["bg"], foreground=c["text"],
+            font=(UI_FONT, 13, "bold"),
+        )
+        self.style.configure(
+            "Badge.TLabel", background=c["accent_soft"],
+            foreground=c["accent_text"], font=(UI_FONT, 9, "bold"),
+            padding=(8, 2),
+        )
+        self.style.configure(
+            "Count.TLabel", background=c["card"], foreground=c["muted"],
+            font=(UI_FONT, 9),
+        )
+        self.style.configure(
+            "TEntry", fieldbackground=c["card"], foreground=c["text"],
+            bordercolor=c["border"], lightcolor=c["border"],
+            darkcolor=c["border"], insertcolor=c["text"], padding=6,
+        )
+        self.style.map(
+            "TEntry",
+            bordercolor=[("focus", c["accent"])],
+            lightcolor=[("focus", c["accent"])],
+            darkcolor=[("focus", c["accent"])],
+        )
+        self.style.configure(
+            "TCombobox", fieldbackground=c["card"], background=c["card"],
+            foreground=c["text"], arrowcolor=c["muted"],
+            bordercolor=c["border"], padding=5,
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", c["card"])],
+            bordercolor=[("focus", c["accent"])],
+        )
+        self.style.configure(
+            "TButton", background="#f7f8fc", foreground=c["text"],
+            bordercolor="#d6dbe5", lightcolor="#f7f8fc",
+            darkcolor="#f7f8fc", padding=(12, 7), font=font,
+            relief="flat",
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", "#eef1f7"), ("disabled", "#f5f6f9")],
+            foreground=[("disabled", c["faint"])],
+            bordercolor=[("active", "#c9ceda")],
+        )
+        self.style.configure(
+            "Primary.TButton", background=c["accent"], foreground="#ffffff",
+            bordercolor=c["accent"], lightcolor=c["accent"],
+            darkcolor=c["accent"], padding=(18, 8), font=font_bold,
+        )
+        self.style.map(
+            "Primary.TButton",
+            background=[
+                ("active", c["accent_hover"]),
+                ("pressed", c["accent_text"]),
+                ("disabled", "#f3c7d6"),
+            ],
+            foreground=[("disabled", "#fff7fa")],
+            bordercolor=[
+                ("active", c["accent_hover"]),
+                ("disabled", "#f3c7d6"),
+            ],
+            lightcolor=[("active", c["accent_hover"])],
+            darkcolor=[("active", c["accent_hover"])],
+        )
+        self.style.configure(
+            "Ghost.TButton", background=c["card"], foreground=c["muted"],
+            bordercolor=c["card"], padding=(8, 6), font=(UI_FONT, 9),
+        )
+        self.style.map(
+            "Ghost.TButton",
+            background=[("active", c["accent_soft"])],
+            foreground=[("active", c["accent_text"])],
+        )
+        self.style.configure(
+            "Danger.TButton", background=c["card"], foreground=c["red"],
+            bordercolor="#f0c9c9", padding=(12, 7),
+        )
+        self.style.map(
+            "Danger.TButton",
+            background=[("active", "#fdf0f0"), ("disabled", "#f7f7f9")],
+            foreground=[("disabled", c["faint"])],
+        )
+        self.style.configure(
+            "TNotebook", background=c["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0)
+        )
+        self.style.configure(
+            "TNotebook.Tab", background="#e8ebf2", foreground=c["muted"],
+            padding=(18, 9), font=(UI_FONT, 10),
+            bordercolor=c["border"], lightcolor="#e8ebf2",
+            darkcolor="#e8ebf2",
+        )
+        self.style.map(
+            "TNotebook.Tab",
+            background=[("selected", c["card"]), ("active", "#eef1f6")],
+            foreground=[("selected", c["accent_text"]), ("active", c["text"])],
+            expand=[("selected", (0, 0, 0, 0))],
+        )
+        self.style.configure(
+            "TCheckbutton", background=c["card"], foreground=c["text"],
+            font=(UI_FONT, 9), padding=(2, 2),
+        )
+        self.style.map(
+            "TCheckbutton",
+            background=[("active", c["card"])],
+            indicatorcolor=[("selected", c["accent"])],
+        )
+        self.style.configure(
+            "TRadiobutton", background=c["card"], foreground=c["text"],
+            font=(UI_FONT, 9), padding=(2, 2),
+        )
+        self.style.map(
+            "TRadiobutton",
+            background=[("active", c["card"])],
+            indicatorcolor=[("selected", c["accent"])],
+        )
+        self.style.configure(
+            "Treeview", background=c["card"], fieldbackground=c["card"],
+            foreground=c["text"], borderwidth=0, relief="flat",
+            rowheight=30, font=(UI_FONT, 9),
+        )
+        self.style.configure(
+            "Treeview.Heading", background="#eef1f6", foreground=c["muted"],
+            relief="flat", borderwidth=0, padding=(8, 7),
+            font=(UI_FONT, 9, "bold"),
+        )
+        self.style.map(
+            "Treeview.Heading", background=[("active", "#e6eaf1")]
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", c["accent_soft"])],
+            foreground=[("selected", c["text"])],
+        )
+        self.style.configure(
+            "Horizontal.TProgressbar", troughcolor="#e8ebf2",
+            background=c["accent"], bordercolor="#e8ebf2",
+            lightcolor=c["accent"], darkcolor=c["accent"], thickness=8,
+        )
+        self.style.configure(
+            "Vertical.TScrollbar", background="#dfe3eb", troughcolor=c["card"],
+            bordercolor=c["card"], arrowcolor=c["muted"],
+            lightcolor="#dfe3eb", darkcolor="#dfe3eb", width=12,
+        )
+
+    @staticmethod
+    def _card(parent, padding=(14, 12)) -> tk.Frame:
+        return tk.Frame(
+            parent, bg=UI_COLORS["card"],
+            highlightbackground=UI_COLORS["border"],
+            highlightthickness=1, bd=0,
+            padx=padding[0], pady=padding[1],
+        )
+
+    @staticmethod
+    def _checkbutton(
+        parent, text: str, variable, background: Optional[str] = None,
+        command=None,
+    ) -> tk.Checkbutton:
+        bg = background or UI_COLORS["card"]
+        return tk.Checkbutton(
+            parent, text=text, variable=variable, command=command,
+            bg=bg, fg=UI_COLORS["text"], activebackground=bg,
+            activeforeground=UI_COLORS["text"],
+            selectcolor=UI_COLORS["card"], highlightthickness=0, bd=0,
+            font=(UI_FONT, 9), anchor="w", padx=0, pady=0,
+            cursor="hand2",
         )
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=10)
-        outer.pack(fill="both", expand=True)
-        top = ttk.LabelFrame(outer, text="用户主页与保存位置", padding=8)
-        top.pack(fill="x", pady=(0, 8))
-        top.columnconfigure(1, weight=1)
-        ttk.Label(top, text="用户主页链接：").grid(
-            row=0, column=0, sticky="w", padx=(0, 6), pady=3
-        )
-        self.url_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.url_var).grid(
-            row=0, column=1, sticky="ew", pady=3
-        )
-        self.platform_var = tk.StringVar(
-            value=self.settings.get("platform_mode", "自动识别")
-        )
-        ttk.Combobox(
-            top, textvariable=self.platform_var, state="readonly", width=9,
-            values=("自动识别", "抖音", "快手", "B站"),
-        ).grid(row=0, column=2, padx=(8, 0), pady=3)
-        ttk.Button(top, text="获取作品", command=self.on_fetch).grid(
-            row=0, column=3, padx=(8, 0), pady=3
-        )
-        ttk.Label(top, text="下载目录：").grid(
-            row=1, column=0, sticky="w", padx=(0, 6), pady=3
-        )
+        c = UI_COLORS
+        header = tk.Frame(self.root, bg=c["header"], height=90)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        brand = tk.Frame(header, bg=c["header"])
+        brand.pack(side="left", fill="y", padx=(22, 0))
+        tk.Label(
+            brand, text="日常视频提取器", bg=c["header"], fg="#ffffff",
+            font=(UI_FONT, 17, "bold"),
+        ).pack(anchor="w", pady=(15, 0))
+        tk.Label(
+            brand, text="抖音 · 快手 · B站   本地批量提取与下载",
+            bg=c["header"], fg="#aeb6c9", font=(UI_FONT, 9),
+        ).pack(anchor="w", pady=(2, 0))
+        header_right = tk.Frame(header, bg=c["header"])
+        header_right.pack(side="right", padx=(0, 22))
+        tk.Label(
+            header_right, text=f"v{APP_VERSION}", bg=c["header_soft"],
+            fg="#e6eaf3", font=(UI_FONT, 9, "bold"), padx=10, pady=4,
+        ).pack(side="right")
+        tk.Label(
+            header_right, text="浏览器登录态 · 数据只留在本机",
+            bg=c["header"], fg="#8f98ad", font=(UI_FONT, 9),
+        ).pack(side="right", padx=(0, 12))
+        tk.Frame(self.root, bg=c["accent"], height=3).pack(fill="x")
+
+        body = ttk.Frame(self.root, padding=(18, 12, 18, 10))
+        body.pack(fill="both", expand=True)
+
+        out_card = self._card(body, (14, 10))
+        out_card.pack(fill="x", pady=(0, 10))
+        out_card.columnconfigure(1, weight=1)
+        tk.Label(
+            out_card, text="保存到", bg=c["card"], fg=c["muted"],
+            font=(UI_FONT, 9),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
         default_output = self.settings.get("output_dir") or str(
             APP_BASE_DIR / "抖音下载"
         )
         self.output_var = tk.StringVar(value=default_output)
-        ttk.Entry(top, textvariable=self.output_var).grid(
-            row=1, column=1, sticky="ew", pady=3
+        out_entry = ttk.Entry(out_card, textvariable=self.output_var)
+        out_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(
+            out_card, text="浏览", command=self.choose_output
+        ).grid(row=0, column=2, padx=(10, 0))
+        ttk.Button(
+            out_card, text="打开目录", style="Ghost.TButton",
+            command=self.open_output,
+        ).grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(
+            out_card, text="设置", style="Ghost.TButton",
+            command=self.open_settings,
+        ).grid(row=0, column=4, padx=(2, 0))
+
+        self.notebook = ttk.Notebook(body)
+        self.notebook.pack(fill="x", pady=(0, 10))
+        author_tab = ttk.Frame(
+            self.notebook, padding=(14, 10), style="Card.TFrame"
         )
-        ttk.Button(top, text="浏览...", command=self.choose_output).grid(
-            row=1, column=2, columnspan=2, sticky="ew", padx=(8, 0), pady=3
+        links_tab = ttk.Frame(
+            self.notebook, padding=(14, 10), style="Card.TFrame"
         )
-        filters = ttk.LabelFrame(outer, text="日期筛选", padding=8)
-        filters.pack(fill="x", pady=(0, 8))
+        self.notebook.add(author_tab, text="  UP主主页  ")
+        self.notebook.add(links_tab, text="  视频链接  ")
+        author_tab.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            author_tab,
+            text="粘贴用户主页链接，按日期读取作品；B站空间页会自动翻页。",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        tk.Label(
+            author_tab, text="主页链接", bg=c["card"], fg=c["text"],
+            font=(UI_FONT, 9),
+        ).grid(row=1, column=0, sticky="w", padx=(0, 10))
+        self.url_var = tk.StringVar()
+        url_entry = ttk.Entry(author_tab, textvariable=self.url_var)
+        url_entry.grid(row=1, column=1, sticky="ew")
+        url_entry.bind("<Return>", lambda _event: self.on_fetch())
+        self.platform_var = tk.StringVar(
+            value=self.settings.get("platform_mode", "自动识别")
+        )
+        ttk.Combobox(
+            author_tab, textvariable=self.platform_var, state="readonly",
+            width=9, values=("自动识别", "抖音", "快手", "B站"),
+        ).grid(row=1, column=2, padx=(10, 10))
+        self.fetch_btn = ttk.Button(
+            author_tab, text="读取作品", style="Primary.TButton",
+            command=self.on_fetch,
+        )
+        self.fetch_btn.grid(row=1, column=3)
+
+        tk.Label(
+            author_tab, text="日期筛选", bg=c["card"], fg=c["text"],
+            font=(UI_FONT, 9),
+        ).grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(9, 0))
+        date_row = tk.Frame(author_tab, bg=c["card"])
+        date_row.grid(row=2, column=1, columnspan=3, sticky="w", pady=(9, 0))
         self.date_var = tk.StringVar(
             value=self.settings.get("date_mode", "全部")
         )
         for text in ("今天", "昨天", "近7天", "全部", "自定义"):
             ttk.Radiobutton(
-                filters, text=text, value=text, variable=self.date_var,
+                date_row, text=text, value=text, variable=self.date_var,
                 command=self._date_changed,
             ).pack(side="left", padx=(0, 8))
-        ttk.Label(filters, text="从").pack(side="left", padx=(8, 3))
+        tk.Label(
+            date_row, text="从", bg=c["card"], fg=c["muted"],
+            font=(UI_FONT, 9),
+        ).pack(side="left", padx=(10, 4))
         self.start_var = tk.StringVar(
             value=self.settings.get("start_date")
             or datetime.now(CST).date().isoformat()
         )
         self.start_entry = ttk.Entry(
-            filters, textvariable=self.start_var, width=12
+            date_row, textvariable=self.start_var, width=11
         )
         self.start_entry.pack(side="left")
-        ttk.Label(filters, text="到").pack(side="left", padx=(6, 3))
+        tk.Label(
+            date_row, text="到", bg=c["card"], fg=c["muted"],
+            font=(UI_FONT, 9),
+        ).pack(side="left", padx=(8, 4))
         self.end_var = tk.StringVar(
             value=self.settings.get("end_date")
             or datetime.now(CST).date().isoformat()
         )
         self.end_entry = ttk.Entry(
-            filters, textvariable=self.end_var, width=12
+            date_row, textvariable=self.end_var, width=11
         )
         self.end_entry.pack(side="left")
+
+        options_row = tk.Frame(author_tab, bg=c["card"])
+        options_row.grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(7, 0)
+        )
         self.browser_var = tk.BooleanVar(
             value=bool(self.settings.get("browser_mode", True))
         )
-        ttk.Checkbutton(
-            filters, text="使用本机浏览器登录态（推荐）", variable=self.browser_var
+        self._checkbutton(
+            options_row, "使用本机浏览器登录态（B站 / 快手推荐）",
+            self.browser_var,
+        ).pack(side="left")
+        self.auto_page_var = tk.BooleanVar(
+            value=bool(self.settings.get("bilibili_auto_page", True))
+        )
+        self._checkbutton(
+            options_row, "B站自动翻页", self.auto_page_var,
+        ).pack(side="left", padx=(16, 0))
+        tk.Label(
+            options_row, text="首次使用会自动打开 Edge / Chrome",
+            bg=c["card"], fg=c["faint"], font=(UI_FONT, 9),
+        ).pack(side="left", padx=(14, 0))
+
+        links_tab.columnconfigure(0, weight=1)
+        ttk.Label(
+            links_tab,
+            text="支持 BV 号、av 号、视频页链接和 b23.tv 短链；"
+                 "可一次粘贴多条，每行一个。",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        link_box = tk.Frame(
+            links_tab, bg="#fbfcfe",
+            highlightbackground=c["border"], highlightthickness=1, bd=0,
+        )
+        link_box.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        link_box.columnconfigure(0, weight=1)
+        link_box.rowconfigure(0, weight=1)
+        self.link_text = tk.Text(
+            link_box, height=3, width=1, wrap="word", relief="flat", bd=0,
+            bg="#fbfcfe", fg=c["text"], insertbackground=c["text"],
+            font=(UI_FONT, 10), padx=9, pady=7,
+            selectbackground=c["accent_soft"], selectforeground=c["text"],
+        )
+        self.link_text.grid(row=0, column=0, sticky="nsew")
+        link_scroll = ttk.Scrollbar(
+            link_box, orient="vertical", command=self.link_text.yview
+        )
+        link_scroll.grid(row=0, column=1, sticky="ns")
+        self.link_text.configure(yscrollcommand=link_scroll.set)
+        links_footer = tk.Frame(links_tab, bg=c["card"])
+        links_footer.grid(
+            row=2, column=0, sticky="w", pady=(7, 0)
+        )
+        self.split_parts_var = tk.BooleanVar(
+            value=bool(self.settings.get("bilibili_split_parts", False))
+        )
+        self._checkbutton(
+            links_footer, "多P视频也提取全部分P", self.split_parts_var,
+        ).pack(side="left")
+        tk.Label(
+            links_footer,
+            text="默认取 P1，可用 ?p=2 指定分P",
+            bg=c["card"], fg=c["faint"], font=(UI_FONT, 9),
         ).pack(side="left", padx=(12, 0))
-        actions = ttk.Frame(outer)
-        actions.pack(fill="x", pady=(0, 8))
-        ttk.Button(actions, text="全选", command=self.select_all).pack(side="left")
-        ttk.Button(
-            actions, text="取消选择", command=self.clear_selection
-        ).pack(side="left", padx=(6, 0))
-        self.download_btn = ttk.Button(
-            actions, text="下载选中", command=self.on_download,
-            state="disabled",
+        links_actions = tk.Frame(links_tab, bg=c["card"])
+        links_actions.grid(row=2, column=1, sticky="e", pady=(7, 0))
+        self.parse_btn = ttk.Button(
+            links_actions, text="解析链接", style="Primary.TButton",
+            command=self.on_parse_links,
         )
-        self.download_btn.pack(side="left", padx=(14, 0))
+        self.parse_btn.pack(side="right")
+        ttk.Button(
+            links_actions, text="粘贴", command=self.paste_links,
+        ).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            links_actions, text="清空",
+            command=self.clear_links,
+        ).pack(side="right", padx=(0, 4))
+
+        result_card = self._card(body, (14, 8))
+        result_card.pack(fill="both", expand=True, pady=(0, 8))
+        result_card.columnconfigure(0, weight=1)
+        result_card.rowconfigure(1, weight=1)
+        result_head = tk.Frame(result_card, bg=c["card"])
+        result_head.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        tk.Label(
+            result_head, text="作品列表", bg=c["card"], fg=c["text"],
+            font=(UI_FONT, 11, "bold"),
+        ).pack(side="left")
+        self.results_count_var = tk.StringVar(value="共 0 条")
+        tk.Label(
+            result_head, textvariable=self.results_count_var,
+            bg=c["card"], fg=c["muted"], font=(UI_FONT, 9),
+        ).pack(side="left", padx=(10, 0))
         self.cancel_btn = ttk.Button(
-            actions, text="取消任务", command=self.on_cancel,
-            state="disabled",
+            result_head, text="取消任务", style="Danger.TButton",
+            command=self.on_cancel, state="disabled",
         )
-        self.cancel_btn.pack(side="left", padx=(6, 0))
+        self.cancel_btn.pack(side="right")
+        self.download_btn = ttk.Button(
+            result_head, text="下载选中", style="Primary.TButton",
+            command=self.on_download, state="disabled",
+        )
+        self.download_btn.pack(side="right", padx=(0, 8))
         ttk.Button(
-            actions, text="打开下载目录", command=self.open_output
-        ).pack(side="left", padx=(6, 0))
+            result_head, text="取消选择", style="Ghost.TButton",
+            command=self.clear_selection,
+        ).pack(side="right", padx=(0, 8))
         ttk.Button(
-            actions, text="设置", command=self.open_settings
-        ).pack(side="right")
-        tree_frame = ttk.LabelFrame(outer, text="作品列表", padding=5)
-        tree_frame.pack(fill="both", expand=True, pady=(0, 8))
-        columns = ("date", "time", "desc", "duration", "status")
+            result_head, text="全选", style="Ghost.TButton",
+            command=self.select_all,
+        ).pack(side="right", padx=(0, 8))
+
+        tree_wrap = tk.Frame(result_card, bg=c["card"])
+        tree_wrap.grid(row=1, column=0, sticky="nsew")
+        tree_wrap.columnconfigure(0, weight=1)
+        tree_wrap.rowconfigure(0, weight=1)
+        columns = ("platform", "date", "time", "desc", "duration", "status")
         self.tree = ttk.Treeview(
-            tree_frame, columns=columns, show="headings",
-            selectmode="extended",
+            tree_wrap, columns=columns, show="headings",
+            selectmode="extended", height=3,
         )
-        for column, title, width, anchor in (
-            ("date", "日期", 95, "center"),
-            ("time", "时间", 80, "center"),
-            ("desc", "标题", 520, "w"),
-            ("duration", "时长", 70, "center"),
-            ("status", "状态", 90, "center"),
+        for column, title, width, anchor, stretch in (
+            ("platform", "平台", 62, "center", False),
+            ("date", "日期", 118, "center", False),
+            ("time", "时间", 92, "center", False),
+            ("desc", "标题", 560, "w", True),
+            ("duration", "时长", 70, "center", False),
+            ("status", "状态", 96, "center", False),
         ):
             self.tree.heading(column, text=title)
-            self.tree.column(column, width=width, anchor=anchor)
-        scrollbar = ttk.Scrollbar(
-            tree_frame, orient="vertical", command=self.tree.yview
+            self.tree.column(
+                column, width=width, anchor=anchor, stretch=stretch,
+                minwidth=40,
+            )
+        self.tree.tag_configure("odd", background=c["stripe"])
+        self.tree.tag_configure("even", background=c["card"])
+        tree_scroll = ttk.Scrollbar(
+            tree_wrap, orient="vertical", command=self.tree.yview
         )
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll.grid(row=0, column=1, sticky="ns")
         self.tree.bind("<Double-1>", self.open_selected_video)
-        progress_frame = ttk.Frame(outer)
-        progress_frame.pack(fill="x", pady=(0, 6))
+        self.tree.bind("<Control-a>", self._select_all_event)
+        self.tree_menu = tk.Menu(
+            self.root, tearoff=0, bg=c["card"], fg=c["text"],
+            activebackground=c["accent_soft"],
+            activeforeground=c["accent_text"], bd=0,
+            font=(UI_FONT, 9),
+        )
+        self.tree_menu.add_command(
+            label="打开视频链接", command=self.open_selected_video
+        )
+        self.tree_menu.add_command(
+            label="复制视频链接", command=self.copy_selected_link
+        )
+        self.tree_menu.add_command(
+            label="复制标题", command=self.copy_selected_title
+        )
+        self.tree.bind("<Button-3>", self._show_tree_menu)
+
+        progress_row = ttk.Frame(body)
+        progress_row.pack(side="bottom", fill="x", pady=(0, 4))
+        self.log_btn = ttk.Button(
+            progress_row, text="显示日志", style="Ghost.TButton",
+            command=self.toggle_log,
+        )
+        self.log_btn.pack(side="right")
         self.progress = ttk.Progressbar(
-            progress_frame, mode="determinate", maximum=100
+            progress_row, mode="determinate", maximum=100
         )
         self.progress.pack(side="left", fill="x", expand=True)
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(
-            progress_frame, textvariable=self.status_var, width=36
-        ).pack(side="left", padx=(10, 0))
-        log_frame = ttk.LabelFrame(outer, text="运行日志", padding=4)
-        log_frame.pack(fill="x")
-        self.log_text = tk.Text(
-            log_frame, height=7, wrap="word", state="disabled"
-        )
+        tk.Label(
+            progress_row, textvariable=self.status_var, bg=c["bg"],
+            fg=c["muted"], font=(UI_FONT, 9), width=38, anchor="e",
+        ).pack(side="left", padx=(12, 8))
+
+        log_card = self._card(body, (14, 6))
+        self.log_card = log_card
+        log_head = tk.Frame(log_card, bg=c["card"])
+        log_head.pack(fill="x")
+        tk.Label(
+            log_head, text="运行日志", bg=c["card"], fg=c["text"],
+            font=(UI_FONT, 9, "bold"),
+        ).pack(side="left")
+        ttk.Button(
+            log_head, text="清空", style="Ghost.TButton",
+            command=self.clear_log,
+        ).pack(side="right")
+        log_body = tk.Frame(log_card, bg=c["card"])
+        log_body.pack(fill="x", pady=(5, 0))
         log_scroll = ttk.Scrollbar(
-            log_frame, orient="vertical", command=self.log_text.yview
+            log_body, orient="vertical", command=lambda: None
         )
+        self.log_text = tk.Text(
+            log_body, height=3, width=1, wrap="word", state="disabled",
+            bg="#fbfcfe", fg=c["muted"], relief="flat", bd=0,
+            font=(UI_FONT, 9), padx=8, pady=6,
+            selectbackground=c["accent_soft"], selectforeground=c["text"],
+        )
+        log_scroll.configure(command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
+        if bool(self.settings.get("show_log", False)):
+            self.log_card.pack(side="bottom", fill="x", pady=(0, 6))
+            self.log_btn.configure(text="收起日志")
         self._date_changed()
+
+    def toggle_log(self) -> None:
+        try:
+            visible = bool(self.log_card.winfo_manager())
+        except Exception:
+            visible = False
+        if visible:
+            self.log_card.pack_forget()
+            self.log_btn.configure(text="显示日志")
+        else:
+            self.log_card.pack(side="bottom", fill="x", pady=(0, 6))
+            self.log_btn.configure(text="收起日志")
+
+    def _select_all_event(self, _event=None):
+        self.select_all()
+        return "break"
+
+    def _show_tree_menu(self, event) -> None:
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        if row not in self.tree.selection():
+            self.tree.selection_set(row)
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.tree_menu.grab_release()
+            except Exception:
+                pass
+
+    def copy_selected_link(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        video = self.video_by_iid.get(selected[0])
+        if not video:
+            return
+        link = video.share_fallback()
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(link)
+            self._set_status("已复制视频链接")
+        except Exception as exc:
+            self._log("复制链接失败：" + str(exc))
+
+    def copy_selected_title(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        video = self.video_by_iid.get(selected[0])
+        if not video:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(video.desc or video.aweme_id)
+            self._set_status("已复制标题")
+        except Exception as exc:
+            self._log("复制标题失败：" + str(exc))
+
+    def clear_log(self) -> None:
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    def paste_links(self) -> None:
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            text = ""
+        if not text:
+            self._set_status("剪贴板为空")
+            return
+        current = self.link_text.get("1.0", "end").strip()
+        if current:
+            self.link_text.insert("end", "\n" + text.strip())
+        else:
+            self.link_text.insert("1.0", text.strip())
+        self._set_status("已从剪贴板粘贴")
+
+    def clear_links(self) -> None:
+        self.link_text.delete("1.0", "end")
+        self._set_status("已清空链接输入")
+
     def _date_changed(self) -> None:
         state = "normal" if self.date_var.get() == "自定义" else "disabled"
         try:
@@ -3694,6 +4881,9 @@ class DouyinApp:
             self.download_btn.configure(
                 state="normal" if (not busy and self.videos) else "disabled"
             )
+            busy_state = "disabled" if busy else "normal"
+            self.fetch_btn.configure(state=busy_state)
+            self.parse_btn.configure(state=busy_state)
         except Exception:
             pass
 
@@ -3737,22 +4927,32 @@ class DouyinApp:
         self.video_by_iid = {}
         self.download_total = 0
         self.download_completed = 0
+        try:
+            self.results_count_var.set("共 0 条")
+        except Exception:
+            pass
 
     def _populate(self, videos: list[VideoMeta]) -> None:
         self._clear_tree()
-        for video in videos:
+        for index, video in enumerate(videos):
             iid = video.aweme_id
             if iid in self.video_by_iid:
                 continue
             self.video_by_iid[iid] = video
+            platform = PLATFORM_LABELS.get(video.platform, video.platform or "视频")
             self.tree.insert(
                 "", "end", iid=iid,
                 values=(
-                    video.date_str, video.time_str,
+                    platform, video.date_str, video.time_str,
                     video.desc or "(无标题)", video.duration_text, "待下载",
                 ),
+                tags=("odd" if index % 2 else "even",),
             )
-        self.videos = list(videos)
+        self.videos = [self.video_by_iid[key] for key in self.tree.get_children()]
+        try:
+            self.results_count_var.set(f"共 {len(self.videos)} 条")
+        except Exception:
+            pass
         self.download_btn.configure(
             state="normal" if self.videos and not self.busy else "disabled"
         )
@@ -3830,6 +5030,7 @@ class DouyinApp:
         self.settings["end_date"] = self.end_var.get().strip()
         self.settings["browser_mode"] = use_browser
         self.settings["platform_mode"] = platform_choice
+        self.settings["bilibili_auto_page"] = bool(self.auto_page_var.get())
         self.store.save_settings()
         self._clear_tree()
         self.user = None
@@ -3837,8 +5038,13 @@ class DouyinApp:
         cancel = threading.Event()
         self.cancel_event = cancel
         self._set_busy(True)
-        self._set_status("正在获取作品...")
+        self._set_status("正在获取作品…")
         self._log(f"开始获取。日期范围：{describe_range(begin, finish)}")
+        if selected_platform == "bilibili":
+            if self.auto_page_var.get():
+                self._log("B站自动翻页已开启，读取过程中会自行点击分页。")
+            else:
+                self._log("B站自动翻页已关闭，需要你在浏览器里手动翻页。")
         cookie = (
             self.settings.get("cookie", "")
             if self.settings.get("remember_cookie") else ""
@@ -3846,7 +5052,7 @@ class DouyinApp:
 
         def worker():
             try:
-                self.events.put({"type": "log", "message": "正在准备下载目录..."})
+                self.events.put({"type": "log", "message": "正在准备下载目录…"})
                 output, switched = prepare_output_dir(output_raw)
                 if switched:
                     self.events.put({"type": "output_changed", "path": str(output)})
@@ -3854,7 +5060,7 @@ class DouyinApp:
                     "type": "log",
                     "message": "下载目录：" + str(output),
                 })
-                self.events.put({"type": "log", "message": "正在识别用户链接..."})
+                self.events.put({"type": "log", "message": "正在识别用户链接…"})
                 client = DouyinClient(cookie=cookie, delay=delay, cancel_event=cancel)
                 if use_browser:
                     user, videos = client.fetch_user_videos_own_browser(
@@ -3865,6 +5071,7 @@ class DouyinApp:
                         browser_install=browser_install,
                         restart_browser=restart_browser,
                         platform_choice=platform_choice,
+                        bilibili_auto_page=bool(self.auto_page_var.get()),
                     )
                     download_cookie = client.last_browser_cookie or cookie
                 else:
@@ -3880,7 +5087,7 @@ class DouyinApp:
                 target = output / user_folder_name(user)
                 index_path = self.store.export_index(target, user, videos)
                 self.events.put({
-                    "type": "fetch_done", "user": user,
+                    "type": "fetch_done", "user": user, "mode": "author",
                     "videos": videos, "range": (begin, finish),
                     "index_path": str(index_path),
                     "cookie": download_cookie,
@@ -3891,6 +5098,95 @@ class DouyinApp:
                 self.events.put({"type": "error", "message": exc.message})
             except Exception as exc:
                 LOGGER.exception("fetch worker failed")
+                self.events.put({
+                    "type": "error",
+                    "message": f"未预期错误：{exc}\n详情见日志。",
+                })
+            finally:
+                self.events.put({"type": "task_finished"})
+
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+
+    def _bilibili_cookie(self) -> str:
+        candidates = [self.fetch_cookie]
+        if self.settings.get("remember_cookie"):
+            candidates.append(str(self.settings.get("cookie") or ""))
+        for candidate in candidates:
+            if any(
+                name in candidate
+                for name in ("SESSDATA=", "bili_jct=", "DedeUserID=")
+            ):
+                return candidate
+        return ""
+
+    def on_parse_links(self) -> None:
+        if self.busy:
+            return
+        raw = self.link_text.get("1.0", "end").strip()
+        if not raw:
+            messagebox.showinfo(
+                "缺少链接",
+                "请粘贴至少一个B站视频链接、BV 号或 av 号。",
+            )
+            return
+        try:
+            output_raw = self.output_var.get().strip()
+            if not output_raw:
+                raise ValueError("请选择下载目录。")
+            delay = max(0.5, float(self.settings.get("delay", 1.2)))
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("输入有误", str(exc))
+            return
+        split_parts = bool(self.split_parts_var.get())
+        self.settings["bilibili_split_parts"] = split_parts
+        self.store.save_settings()
+        cookie = self._bilibili_cookie()
+        self._clear_tree()
+        self.user = None
+        cancel = threading.Event()
+        self.cancel_event = cancel
+        self._set_busy(True)
+        self._set_status("正在解析视频链接…")
+        self._log(
+            "开始解析B站视频链接"
+            + ("（多P视频将提取全部分P）。" if split_parts else "。")
+        )
+
+        def worker():
+            try:
+                self.events.put({"type": "log", "message": "正在准备下载目录…"})
+                output, switched = prepare_output_dir(output_raw)
+                if switched:
+                    self.events.put({"type": "output_changed", "path": str(output)})
+                self.events.put({
+                    "type": "log",
+                    "message": "下载目录：" + str(output),
+                })
+                client = DouyinClient(
+                    cookie=cookie, delay=delay, cancel_event=cancel
+                )
+                user, videos = client.fetch_bilibili_videos_by_links(
+                    raw,
+                    split_parts=split_parts,
+                    on_log=lambda message: self.events.put({
+                        "type": "log", "message": message
+                    }),
+                )
+                target = output / user_folder_name(user)
+                index_path = self.store.export_index(target, user, videos)
+                self.events.put({
+                    "type": "fetch_done", "user": user, "mode": "links",
+                    "videos": videos, "range": (None, None),
+                    "index_path": str(index_path),
+                    "cookie": cookie,
+                })
+            except CancelledError as exc:
+                self.events.put({"type": "cancelled", "message": str(exc)})
+            except DouyinError as exc:
+                self.events.put({"type": "error", "message": exc.message})
+            except Exception as exc:
+                LOGGER.exception("link fetch worker failed")
                 self.events.put({
                     "type": "error",
                     "message": f"未预期错误：{exc}\n详情见日志。",
@@ -4074,17 +5370,38 @@ class DouyinApp:
                     self.user = event["user"]
                     self.fetch_cookie = str(event.get("cookie", "") or "")
                     videos = event["videos"]
+                    mode = str(event.get("mode", "author"))
                     begin, finish = event.get("range", (None, None))
                     self._populate(videos)
-                    self._log(
-                        f"完成：{self.user.nickname}，"
-                        f"{describe_range(begin, finish)}，共 {len(videos)} 条作品。"
-                    )
+                    if mode == "links":
+                        self._log(
+                            f"完成：{self.user.nickname}，"
+                            f"共 {len(videos)} 条视频。"
+                        )
+                        self._log(
+                            "已按发布日期排序；可全选下载，也可以在列表中"
+                            "按需选择后点击“下载选中”。"
+                        )
+                    else:
+                        self._log(
+                            f"完成：{self.user.nickname}，"
+                            f"{describe_range(begin, finish)}，"
+                            f"共 {len(videos)} 条作品。"
+                        )
                     if self.user.notice:
                         self._log("提示：" + self.user.notice)
                     if not videos:
-                        self._log("当前日期范围内没有作品；请把日期改为全部或自定义范围后重试。")
-                        self._set_status("该日期范围没有作品")
+                        if mode == "links":
+                            self._log("没有解析到可下载的视频。")
+                            self._set_status("没有解析到视频")
+                        else:
+                            self._log(
+                                "当前日期范围内没有作品；"
+                                "请把日期改为全部或自定义范围后重试。"
+                            )
+                            self._set_status("该日期范围没有作品")
+                    elif mode == "links":
+                        self._set_status(f"已解析 {len(videos)} 条视频")
                     else:
                         self._set_status(f"已获取 {len(videos)} 条作品")
                 elif kind == "download_started":
@@ -4116,6 +5433,11 @@ class DouyinApp:
                 elif kind == "error":
                     self._log("错误：" + event.get("message", ""))
                     self._set_status("操作失败")
+                    try:
+                        if not self.log_card.winfo_manager():
+                            self.toggle_log()
+                    except Exception:
+                        pass
                     messagebox.showerror("操作失败", event.get("message", "未知错误"))
                 elif kind == "cancelled":
                     self._log("任务已取消。")
@@ -4133,56 +5455,74 @@ class DouyinApp:
     def open_settings(self) -> None:
         if self.busy:
             return
+        c = UI_COLORS
         dialog = tk.Toplevel(self.root)
-        dialog.title("设置")
-        dialog.geometry("660x430")
+        dialog.title("设置 · " + APP_TITLE)
+        dialog.geometry("700x620")
+        dialog.configure(bg=c["bg"])
         dialog.transient(self.root)
         dialog.grab_set()
-        frame = ttk.Frame(dialog, padding=12)
+        frame = ttk.Frame(dialog, padding=(20, 16))
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(1, weight=1)
-        ttk.Label(frame, text="浏览器 Cookie（可选）：").grid(
-            row=0, column=0, sticky="nw", pady=4
+        ttk.Label(
+            frame, text="连接与保存设置", style="DialogTitle.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(
+            frame,
+            text="Cookie 与浏览器登录态只保存在本机，不会上传。",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        ttk.Label(
+            frame, text="浏览器 Cookie（可选）",
+            style="Hint.TLabel",
+        ).grid(row=2, column=0, sticky="nw", pady=5)
+        cookie_text = tk.Text(
+            frame, height=5, wrap="word", relief="flat", bd=0,
+            bg=c["card"], fg=c["text"], insertbackground=c["text"],
+            highlightbackground=c["border"], highlightthickness=1,
+            font=(UI_FONT, 9), padx=8, pady=6,
         )
-        cookie_text = tk.Text(frame, height=5, wrap="word")
-        cookie_text.grid(row=0, column=1, sticky="nsew", pady=4)
+        cookie_text.grid(row=2, column=1, sticky="nsew", pady=5)
         if self.settings.get("remember_cookie"):
             cookie_text.insert("1.0", self.settings.get("cookie", ""))
         remember = tk.BooleanVar(
             value=bool(self.settings.get("remember_cookie", False))
         )
-        ttk.Checkbutton(
-            frame, text="在本机保存 Cookie（敏感信息，勿分享）",
-            variable=remember,
-        ).grid(row=1, column=1, sticky="w", pady=2)
-        ttk.Label(frame, text="请求间隔（秒）：").grid(
-            row=2, column=0, sticky="w", pady=4
-        )
+        self._checkbutton(
+            frame, "在本机保存 Cookie（敏感信息，请勿分享）", remember,
+            background=c["bg"],
+        ).grid(row=3, column=1, sticky="w", pady=2)
+        ttk.Label(
+            frame, text="请求间隔（秒）", style="Hint.TLabel",
+        ).grid(row=4, column=0, sticky="w", pady=5)
         delay_var = tk.StringVar(value=str(self.settings.get("delay", 1.2)))
-        ttk.Entry(frame, textvariable=delay_var, width=12).grid(
-            row=2, column=1, sticky="w", pady=4
+        ttk.Entry(frame, textvariable=delay_var, width=14).grid(
+            row=4, column=1, sticky="w", pady=5
         )
-        ttk.Label(frame, text="本机浏览器：").grid(
-            row=3, column=0, sticky="w", pady=4
-        )
+        ttk.Label(
+            frame, text="本机浏览器", style="Hint.TLabel",
+        ).grid(row=5, column=0, sticky="w", pady=5)
         browser_choice_var = tk.StringVar(
             value=str(self.settings.get("browser_choice", "auto"))
         )
         ttk.Combobox(
             frame, textvariable=browser_choice_var,
-            values=("auto", "edge", "chrome"), state="readonly", width=12,
-        ).grid(row=3, column=1, sticky="w", pady=4)
+            values=("auto", "edge", "chrome"), state="readonly", width=14,
+        ).grid(row=5, column=1, sticky="w", pady=5)
         ttk.Label(
             frame,
             text=(
-                "提示：浏览器模式会直接使用本机 Edge/Chrome 的登录状态。"
-                "使用前需要关闭该浏览器；程序会询问是否自动重启。"
-                "Cookie 只保存在本机。"
+                "浏览器模式会直接使用本机 Edge/Chrome 的登录状态。"
+                "使用前需要关闭该浏览器，程序会询问是否自动重启。\n"
+                "B站作者页支持自动翻页；单个视频可以在主界面的"
+                "“视频链接”标签页里直接解析，不需要打开浏览器。"
             ),
-            wraplength=580, foreground="#555555",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 4))
+            style="Hint.TLabel",
+            wraplength=610,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 4))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(18, 0))
 
         def save() -> None:
             try:
@@ -4200,10 +5540,12 @@ class DouyinApp:
             dialog.destroy()
             self._log("设置已保存。")
 
-        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="right")
-        ttk.Button(buttons, text="保存", command=save).pack(
-            side="right", padx=(0, 8)
-        )
+        ttk.Button(
+            buttons, text="取消", command=dialog.destroy
+        ).pack(side="right")
+        ttk.Button(
+            buttons, text="保存", style="Primary.TButton", command=save
+        ).pack(side="right", padx=(0, 8))
 
     def open_output(self) -> None:
         try:
@@ -4250,6 +5592,7 @@ class DouyinApp:
         try:
             self.settings["window_geometry"] = self.root.geometry()
             self.settings["output_dir"] = self.output_var.get().strip()
+            self.settings["show_log"] = bool(self.log_card.winfo_manager())
             self.store.save_settings()
         except Exception:
             pass
@@ -4319,6 +5662,7 @@ def run_cli(args) -> int:
                 browser_install=find_own_browser(args.browser_choice),
                 restart_browser=args.restart_browser,
                 platform_choice=args.platform,
+                bilibili_auto_page=not args.no_bili_auto_page,
             )
             if client.last_browser_cookie:
                 client.http.cookie = client.last_browser_cookie
@@ -4403,9 +5747,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cookie", default="", help="可选：浏览器 Cookie")
     parser.add_argument("--max-pages", type=int, default=50, help="最大翻页数")
+    parser.add_argument(
+        "--no-bili-auto-page", action="store_true",
+        help="B站作者页不自动翻页（默认自动点击下一页）",
+    )
     parser.add_argument("--delay", type=float, default=1.2, help="请求间隔秒数")
     parser.add_argument("--gui", action="store_true", help="启动 GUI")
     return parser
+
+
+def _enable_high_dpi() -> None:
+    """Make Tk text crisp on Windows high-DPI displays."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 def run_gui() -> int:
@@ -4419,7 +5781,16 @@ def run_gui() -> int:
         return 1
     store = Store()
     setup_logging()
+    _enable_high_dpi()
     root = tk.Tk()
+    try:
+        icon_path = APP_BASE_DIR / "assets" / "douyin_daily_icon.png"
+        if icon_path.exists():
+            icon = tk.PhotoImage(file=str(icon_path))
+            root.iconphoto(True, icon)
+            root._icon_image = icon
+    except Exception:
+        pass
     DouyinApp(root, store)
     root.mainloop()
     return 0
