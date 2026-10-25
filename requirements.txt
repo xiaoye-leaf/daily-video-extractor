@@ -1,0 +1,3 @@
+# 运行时依赖：无。
+# 本程序运行时只使用 Python 标准库，不需要执行 pip install。
+# 仅打包 exe 时需要 PyInstaller，由 build.bat 自动安装，不属于运行时依赖。

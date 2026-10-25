@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Runtime data, browser profiles and downloaded media
+.douyin_data/
+.douyin_runtime/
+抖音下载/
+*.part
+*.part.*
+*.log
+
+# Backups and build artifacts
+.backup_v120/
+build/
+dist/
+*.spec.bak
+assets/icon_preview.png
+
+# Local OS / editor files
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.crx
