@@ -49,7 +49,7 @@ except Exception:
     messagebox = None
 
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 APP_TITLE = "日常视频提取器（抖音/快手/B站） v" + APP_VERSION
 
 
@@ -101,7 +101,28 @@ PLATFORM_LOGIN_COOKIES = {
     "bilibili": ("SESSDATA=", "bili_jct=", "DedeUserID="),
 }
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
-AWEME_RE = re.compile(r"(?:/video/|modal_id=|aweme_id=)(\d{10,25})")
+AWEME_RE = re.compile(
+    r"(?:/video/|/note/|/share/video/|modal_id=|aweme_id=)(\d{10,25})"
+)
+KUAISHOU_VIDEO_RE = re.compile(
+    r"/(?:short-video|fw/photo)/([A-Za-z0-9_\-]{6,40})", re.I
+)
+KUAISHOU_SHORT_RE = re.compile(
+    r"(?:https?://)?(?:v\.kuaishou\.com|v\.m\.chenzhongtech\.com)/"
+    r"([A-Za-z0-9_\-]{4,40})",
+    re.I,
+)
+LINK_TOKEN_RE = re.compile(
+    r"https?://[^\s<>\"'，。；、）】》]+"
+    r"|(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])"
+    r"|(?<![0-9A-Za-z])av\d{1,12}(?![0-9])"
+    r"|(?:https?://)?(?:v\.douyin\.com|v\.kuaishou\.com|"
+    r"v\.m\.chenzhongtech\.com)/[A-Za-z0-9_\-]+"
+    r"(?:[?&#][^\s<>\"'，。；、）】》]*)?"
+    r"|(?<![0-9A-Za-z])3x[0-9a-z]{8,20}(?![0-9A-Za-z])"
+    r"|(?<![0-9A-Za-z])\d{19}(?![0-9])",
+    re.I,
+)
 LOGGER = logging.getLogger("douyin_daily")
 BROWSER_CAPTURE_DONE_GRACE = 0.25
 BROWSER_CAPTURE_STALL_SECONDS = 6.0
@@ -110,9 +131,13 @@ BROWSER_CAPTURE_BILIBILI_STALL_SECONDS = 18.0
 BROWSER_CAPTURE_BILIBILI_TIMEOUT = 240.0
 BROWSER_CAPTURE_BILIBILI_MANUAL_STALL_SECONDS = 35.0
 BROWSER_LAUNCH_ATTEMPTS = 3
+BROWSER_START_TIMEOUT = 8.0
 BROWSER_EXTENSION_READY_TIMEOUT = 8.0
 BROWSER_PAGE_BRIDGE_TIMEOUT = 12.0
 BROWSER_LAUNCH_QUIET_SECONDS = 0.6
+BROWSER_VIDEO_TIMEOUT = 50.0
+BROWSER_VIDEO_MIN_WAIT = 6.0
+BROWSER_BACKGROUND_PROFILES = ("bilibili", "douyin")
 
 UI_FONT = "Microsoft YaHei UI"
 UI_MONO_FONT = "Consolas"
@@ -358,6 +383,131 @@ def parse_bilibili_video_links(raw_text: str) -> list["BilibiliVideoRef"]:
     return refs
 
 
+def _url_host(value: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(value).netloc or "").lower()
+    except ValueError:
+        return ""
+
+
+def _host_matches(host: str, domain: str) -> bool:
+    return host == domain or host.endswith("." + domain)
+
+
+def _bilibili_video_ref(
+    ref: "BilibiliVideoRef", token: str
+) -> "VideoLinkRef":
+    return VideoLinkRef(
+        platform="bilibili",
+        url=ref.url or token,
+        video_id=ref.bvid or (f"av{ref.aid}" if ref.aid else ""),
+        page=ref.page,
+        short_url=ref.short_url,
+        raw=token,
+    )
+
+
+def parse_video_links(raw_text: str) -> list["VideoLinkRef"]:
+    """Split pasted text into Douyin / Kuaishou / Bilibili video links.
+
+    Share captions are accepted: only the URL (or a bare id) inside the text
+    is used.  Short links are kept as references and resolved later.
+    """
+    text = urllib.parse.unquote(str(raw_text or ""))
+    if not text.strip():
+        return []
+    refs: list[VideoLinkRef] = []
+    seen: set[str] = set()
+
+    def add(ref: VideoLinkRef) -> None:
+        if not ref.video_id and not ref.url:
+            return
+        key = ref.key
+        if key in seen:
+            return
+        seen.add(key)
+        refs.append(ref)
+
+    for match in LINK_TOKEN_RE.finditer(text):
+        token = match.group(0).strip().strip("\"'<>()[]{}，。；、）】》")
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered.startswith("http") or (
+            lowered.startswith(("v.douyin.com/", "v.kuaishou.com/",
+                                "v.m.chenzhongtech.com/"))
+        ):
+            if not lowered.startswith("http"):
+                token = "https://" + token
+            host = _url_host(token)
+            if (
+                _host_matches(host, "bilibili.com")
+                or _host_matches(host, "b23.tv")
+                or _host_matches(host, "bili2233.cn")
+            ):
+                for ref in parse_bilibili_video_links(token):
+                    add(_bilibili_video_ref(ref, token))
+                continue
+            if _host_matches(host, "douyin.com") or _host_matches(
+                host, "iesdouyin.com"
+            ):
+                found = AWEME_RE.search(token)
+                if found:
+                    add(VideoLinkRef(
+                        platform="douyin",
+                        url=token,
+                        video_id=found.group(1),
+                        raw=token,
+                    ))
+                elif host.startswith("v."):
+                    code = urllib.parse.urlsplit(token).path.strip("/").split(
+                        "/"
+                    )[0]
+                    if code:
+                        add(VideoLinkRef(
+                            platform="douyin", url=token, video_id=code,
+                            short_url=True, raw=token,
+                        ))
+                continue
+            if (
+                _host_matches(host, "kuaishou.com")
+                or _host_matches(host, "chenzhongtech.com")
+            ):
+                found = KUAISHOU_VIDEO_RE.search(token)
+                if found:
+                    add(VideoLinkRef(
+                        platform="kuaishou",
+                        url=token,
+                        video_id=found.group(1),
+                        raw=token,
+                    ))
+                elif host.startswith("v."):
+                    code = urllib.parse.urlsplit(token).path.strip("/").split(
+                        "/"
+                    )[0]
+                    if code:
+                        add(VideoLinkRef(
+                            platform="kuaishou", url=token, video_id=code,
+                            short_url=True, raw=token,
+                        ))
+                continue
+
+        if lowered.startswith("bv") or lowered.startswith("av"):
+            for ref in parse_bilibili_video_links(token):
+                add(_bilibili_video_ref(ref, token))
+            continue
+        if token.isdigit() and len(token) >= 15:
+            add(VideoLinkRef(
+                platform="douyin", video_id=token, raw=token,
+            ))
+            continue
+        if re.fullmatch(r"3x[0-9a-z]{8,20}", token, re.I):
+            add(VideoLinkRef(
+                platform="kuaishou", video_id=token, raw=token,
+            ))
+    return refs
+
+
 def extract_kuaishou_user_id(raw_value: str) -> str:
     text = urllib.parse.unquote(str(raw_value or ""))
     match = KUAISHOU_PROFILE_RE.search(text)
@@ -508,6 +658,12 @@ def bridge_extract_page(
         return video_items, more
 
     if platform == "kuaishou":
+        for obj in _walk(payload):
+            if not isinstance(obj, dict):
+                continue
+            detail = obj.get("visionVideoDetail")
+            if isinstance(detail, dict) and isinstance(detail.get("photo"), dict):
+                return [detail["photo"]], False
         for obj in _walk(payload):
             if not isinstance(obj, dict):
                 continue
@@ -996,6 +1152,18 @@ def build_cookie_header(
         seen.add(name)
         result.append(f"{name}={value}")
     return "; ".join(result)
+class _BrowserBridgeHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address) -> None:
+        # The browser closes keep-alive sockets abruptly during navigation;
+        # those resets are expected and should not pollute the app log.
+        error = sys.exc_info()[1]
+        if isinstance(
+            error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+        ):
+            return
+        super().handle_error(request, client_address)
+
+
 class _BrowserBridgeHandler(BaseHTTPRequestHandler):
     def _read_json(self):
         length = _to_int(self.headers.get("Content-Length"), 0)
@@ -1008,8 +1176,19 @@ class _BrowserBridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.end_headers()
         self.wfile.write(data)
+
+    def do_OPTIONS(self) -> None:
+        # Chrome may preflight requests from HTTPS pages to 127.0.0.1
+        # (Private Network Access). Answer it explicitly.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.end_headers()
 
     def do_GET(self) -> None:
         if self.path.startswith("/status"):
@@ -1055,6 +1234,7 @@ class BrowserBridgeServer:
         self.last_data_at = self.started_at
         self.capture_done_at: Optional[float] = None
         self.stop_scroll_requested = False
+        self.reload_requested = False
         self.extension_ready = False
         self.extension_version = ""
         self.inject_ready = False
@@ -1062,8 +1242,10 @@ class BrowserBridgeServer:
         self.page_url = ""
         self.page_title = ""
         self.page_state = ""
+        self.page_video_src = ""
+        self.page_text = ""
         self.page_resources: list[str] = []
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _BrowserBridgeHandler)
+        self.server = _BrowserBridgeHTTPServer(("127.0.0.1", 0), _BrowserBridgeHandler)
         self.server.bridge = self
         self.thread = threading.Thread(
             target=lambda: self.server.serve_forever(poll_interval=0.1),
@@ -1112,6 +1294,7 @@ class BrowserBridgeServer:
             self.api_pages = 0
             self.capture_done_at = None
             self.stop_scroll_requested = False
+            self.reload_requested = False
             self.extension_ready = False
             self.extension_version = ""
             self.inject_ready = False
@@ -1119,6 +1302,8 @@ class BrowserBridgeServer:
             self.page_url = ""
             self.page_title = ""
             self.page_state = ""
+            self.page_video_src = ""
+            self.page_text = ""
             self.page_resources = []
             self.last_data_at = now
             self.started_at = now
@@ -1143,14 +1328,14 @@ class BrowserBridgeServer:
             if data.get("__dyReady"):
                 self.ready = True
                 self.inject_ready = True
-                self.last_data_at = now
                 return
             if data.get("__dyBridgeReady"):
                 self.bridge_ready = True
-                self.last_data_at = now
                 self.page_url = str(data.get("url", "") or "")
                 self.page_title = str(data.get("title", "") or "")
                 self.page_state = str(data.get("state", "") or "")
+                self.page_video_src = str(data.get("videoSrc", "") or "")
+                self.page_text = str(data.get("pageText", "") or "")[:1000]
                 resources = data.get("resources")
                 if isinstance(resources, list):
                     self.page_resources = [
@@ -1198,6 +1383,19 @@ class BrowserBridgeServer:
                 return
 
             items = data.get("aweme_list") or data.get("awemeList")
+            detail = data.get("aweme_detail")
+            if isinstance(detail, dict) and detail.get("aweme_id"):
+                self.last_data_at = now
+                self.raw_packets.append({
+                    "platform": "douyin",
+                    "api": api,
+                    "data": detail,
+                })
+                self.last_page_items = [detail]
+                self.items[f"douyin:{detail['aweme_id']}"] = detail
+                self.ready = True
+                self.api_pages += 1
+                return
             is_posts_payload = isinstance(items, list) or (
                 "has_more" in data or "hasMore" in data
             )
@@ -1227,11 +1425,18 @@ class BrowserBridgeServer:
         with self.lock:
             self.stop_scroll_requested = True
 
+    def request_reload(self) -> None:
+        with self.lock:
+            self.reload_requested = True
+
     def command_snapshot(self) -> dict:
         with self.lock:
+            reload = self.reload_requested
+            self.reload_requested = False
             return {
                 "stop_scroll": self.stop_scroll_requested,
                 "capture_done": self.has_more is False,
+                "reload": reload,
             }
 
     def progress_snapshot(self) -> dict:
@@ -1248,6 +1453,8 @@ class BrowserBridgeServer:
                 "page_url": self.page_url,
                 "page_title": self.page_title,
                 "page_state": self.page_state,
+                "page_video_src": self.page_video_src,
+                "page_text": self.page_text,
                 "page_resources": list(self.page_resources),
                 "has_more": self.has_more,
                 "api_pages": self.api_pages,
@@ -1275,7 +1482,9 @@ class BrowserBridgeServer:
 
 
 def create_browser_bridge_extension(
-    port: int, bilibili_auto_page: bool = True
+    port: int,
+    bilibili_auto_page: bool = True,
+    warmup_url: str = "",
 ) -> Path:
     runtime_dir = APP_BASE_DIR / ".douyin_runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1283,7 +1492,8 @@ def create_browser_bridge_extension(
         prefix="browser_bridge_", dir=str(runtime_dir)
     ))
     page_matches = [
-        "https://www.douyin.com/user/*",
+        "https://www.douyin.com/*",
+        "https://www.bilibili.com/*",
         "https://space.bilibili.com/*",
         "https://www.kuaishou.com/*",
     ]
@@ -1369,6 +1579,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendCookies();
     sendResponse({ok: true});
   }
+  if (message && message.type === "dyGetCommand") {
+    fetch("http://127.0.0.1:" + DY_BRIDGE_PORT + "/command")
+      .then((response) => response.json())
+      .then((command) => sendResponse(command || {}))
+      .catch(() => sendResponse({}));
+    return true;
+  }
+  if (message && message.type === "dyBridgeData") {
+    // Relay page data through the background worker: HTTPS pages may block
+    // direct requests to 127.0.0.1 through CSP / private-network rules.
+    fetch("http://127.0.0.1:" + DY_BRIDGE_PORT + "/data", {
+      method: "POST",
+      headers: {"Content-Type": "text/plain"},
+      body: JSON.stringify(message.payload),
+    }).then(() => sendResponse({ok: true}))
+      .catch(() => sendResponse({ok: false}));
+    return true;
+  }
 });
 setInterval(sendCookies, 3000);
 '''
@@ -1380,6 +1608,26 @@ setInterval(sendCookies, 3000);
   window.__dyBridgeInstalled = true;
 
   const BILI_AUTO_PAGE = __BILI_AUTO_PAGE__;
+  const WARMUP_URL = __WARMUP_URL__;
+  const WARMUP_DELAY = 3200;
+  const isProfilePage = (() => {
+    try {
+      const href = String(location.href || "");
+      return (
+        /douyin\.com\/(user|share\/user)\//.test(href)
+        || /space\.bilibili\.com\//.test(href)
+        || /kuaishou\.com\/profile\//.test(href)
+      );
+    } catch (error) { return false; }
+  })();
+  if (WARMUP_URL && location.href.indexOf(WARMUP_URL) < 0) {
+    try {
+      if (!sessionStorage.getItem("__dyWarmupStarted")) {
+        sessionStorage.setItem("__dyWarmupStarted", "1");
+        setTimeout(() => { location.href = WARMUP_URL; }, WARMUP_DELAY);
+      }
+    } catch (error) {}
+  }
   let scrollTimer = 0;
   let stopped = false;
   let ticks = 0;
@@ -1402,6 +1650,7 @@ setInterval(sendCookies, 3000);
   const platformForUrl = (url) => {
     const value = String(url || "");
     if (value.includes("/aweme/v1/web/aweme/post/")) return "douyin";
+    if (value.includes("/aweme/v1/web/aweme/detail/")) return "douyin";
     if (value.includes("/x/space/") && value.includes("/arc/search")) {
       return "bilibili";
     }
@@ -1820,6 +2069,7 @@ setInterval(sendCookies, 3000);
 
   report({__dyReady: true});
   const kickCapture = () => {
+    if (!isProfilePage) return;
     if (biliHasMore) {
       scheduleBiliNext(250);
     } else {
@@ -1830,13 +2080,15 @@ setInterval(sendCookies, 3000);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) kickCapture();
   });
-  setTimeout(() => nudgeScroll(0), 180);
+  if (isProfilePage) setTimeout(() => nudgeScroll(0), 180);
 })();
 '''
     (extension_dir / "inject.js").write_text(
         inject.replace(
             "__BILI_AUTO_PAGE__",
             "true" if bilibili_auto_page else "false",
+        ).replace(
+            "__WARMUP_URL__", json.dumps(warmup_url or "", ensure_ascii=False)
         ),
         encoding="utf-8",
     )
@@ -1845,16 +2097,28 @@ let commandPollStopped = false;
 const askForCookies = () => {
   try { chrome.runtime.sendMessage({type: "dyGetCookies"}); } catch (error) {}
 };
-const reportPageBridge = async () => {
-  try {
-    await fetch("http://127.0.0.1:" + DY_BRIDGE_PORT + "/data", {
-      method: "POST",
-      headers: {"Content-Type": "text/plain"},
-      body: JSON.stringify({
+const postBridge = (payload) => {
+  try { chrome.runtime.sendMessage({type: "dyBridgeData", payload}); }
+  catch (error) {}
+};
+const reportPageBridge = () => {
+  postBridge({
         __dyBridgeReady: true,
         url: String(location.href || ""),
         title: String(document.title || ""),
         state: String(document.readyState || ""),
+        videoSrc: (() => {
+          try {
+            const video = document.querySelector("video");
+            return video ? String(video.currentSrc || video.src || "") : "";
+          } catch (error) { return ""; }
+        })(),
+        pageText: (() => {
+          try {
+            return String(document.body && document.body.innerText || "")
+              .slice(0, 1000);
+          } catch (error) { return ""; }
+        })(),
         resources: (() => {
           try {
             return performance.getEntriesByType("resource")
@@ -1863,9 +2127,7 @@ const reportPageBridge = async () => {
               .slice(-80);
           } catch (error) { return []; }
         })(),
-      }),
-    });
-  } catch (error) {}
+  });
   askForCookies();
 };
 reportPageBridge();
@@ -1876,8 +2138,17 @@ window.addEventListener("pageshow", reportPageBridge);
 const pollCommand = async () => {
   if (commandPollStopped) return;
   try {
-    const response = await fetch("http://127.0.0.1:" + DY_BRIDGE_PORT + "/command");
-    const command = await response.json();
+    const command = await new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({type: "dyGetCommand"}, (reply) => {
+          resolve(reply || {});
+        });
+      } catch (error) { resolve({}); }
+    });
+    if (command && command.reload) {
+      location.reload();
+      return;
+    }
     if (command && command.stop_scroll) {
       window.postMessage({__dyBridgeCommand: "stopScroll"}, "*");
       if (command.capture_done) commandPollStopped = true;
@@ -1885,19 +2156,13 @@ const pollCommand = async () => {
   } catch (error) {}
   if (!commandPollStopped) setTimeout(pollCommand, 250);
 };
-window.addEventListener("message", async (event) => {
+window.addEventListener("message", (event) => {
   if (event.source !== window || !event.data || !event.data.__dyBridge) return;
-  try {
-    await fetch("http://127.0.0.1:" + DY_BRIDGE_PORT + "/data", {
-      method: "POST",
-      headers: {"Content-Type": "text/plain"},
-      body: JSON.stringify({
-        __bridgePlatform: event.data.platform || "",
-        __bridgeApi: event.data.api || "",
-        data: event.data.data,
-      }),
-    });
-  } catch (error) {}
+  postBridge({
+    __bridgePlatform: event.data.platform || "",
+    __bridgeApi: event.data.api || "",
+    data: event.data.data,
+  });
   askForCookies();
 });
 setTimeout(pollCommand, 300);
@@ -1908,11 +2173,147 @@ setTimeout(pollCommand, 300);
     return extension_dir
 
 
-def launch_browser_with_bridge(install: dict, extension_dir: Path, url: str) -> None:
+def bridge_profile_dir(name: str) -> Path:
+    """Create a fresh, isolated profile directory for one browser launch."""
+    base = APP_BASE_DIR / ".douyin_runtime" / "browser_profiles"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return APP_BASE_DIR / ".douyin_runtime" / f"profile_{int(time.time())}"
+    stamp = (
+        f"{int(time.time() * 1000)}_"
+        f"{os.getpid() % 10000}_{random.randint(100, 999)}"
+    )
+    return base / f"{sanitize_filename(name or 'default', 24)}_{stamp}"
+
+
+def cleanup_old_profiles(keep: int = 6) -> None:
+    """Remove old per-run profiles so they do not fill the disk."""
+    base = APP_BASE_DIR / ".douyin_runtime" / "browser_profiles"
+    try:
+        folders = sorted(
+            (item for item in base.iterdir() if item.is_dir()),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for folder in folders[keep:]:
+        try:
+            shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def profile_browser_pids(profile_dir: Optional[Path]) -> list[int]:
+    """Find msedge/chrome processes that use a specific --user-data-dir."""
+    if os.name != "nt" or not profile_dir:
+        return []
+    target = str(profile_dir).replace("'", "''")
+    script = (
+        f"$p='{target}'; "
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.CommandLine -and $_.CommandLine.Contains($p) } | "
+        "Select-Object -ExpandProperty ProcessId"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                _system32_tool(r"WindowsPowerShell\v1.0\powershell.exe"),
+                "-NoProfile", "-NonInteractive", "-Command", script,
+            ],
+            capture_output=True, text=True, encoding="mbcs", errors="replace",
+            timeout=12,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids: list[int] = []
+    for line in (completed.stdout or "").splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def kill_browser_by_profile(profile_dir: Optional[Path]) -> None:
+    for _ in range(3):
+        pids = profile_browser_pids(profile_dir)
+        if not pids:
+            return
+        for pid in pids:
+            _taskkill(["/PID", str(pid), "/T", "/F"])
+        time.sleep(0.8)
+
+
+def prepare_browser_profile(profile_dir: Optional[Path]) -> None:
+    """Make sure no stale helper instance still holds the profile."""
+    if not profile_dir:
+        return
+    if not Path(profile_dir).exists():
+        return
+    kill_browser_by_profile(profile_dir)
+    try:
+        lock = Path(profile_dir) / "lockfile"
+        if lock.exists():
+            lock.unlink()
+    except OSError:
+        pass
+
+
+def terminate_browser_process(
+    proc: Optional[subprocess.Popen],
+    *,
+    profile_dir: Optional[Path] = None,
+    kill_profile: bool = False,
+) -> None:
+    """Stop the browser instance started by this app, including children."""
+    if kill_profile and profile_dir:
+        kill_browser_by_profile(profile_dir)
+    if proc is None:
+        return
+    pid = int(getattr(proc, "pid", 0) or 0)
+    if pid and os.name == "nt":
+        _taskkill(["/PID", str(pid), "/T", "/F"])
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=6)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def launch_browser_with_bridge(
+    install: dict,
+    extension_dir: Path,
+    url: str,
+    *,
+    headless: bool = False,
+    offscreen: bool = False,
+    user_data_dir: Optional[Path] = None,
+    profile_name: str = "",
+) -> subprocess.Popen:
+    """Launch Edge/Chrome with the helper extension.
+
+    ``headless`` runs the new headless mode (no window at all). ``offscreen``
+    keeps a real window but places it far outside the visible desktop, which
+    is the fallback when a site rejects headless browsers.
+    """
+    profile_dir = (
+        Path(user_data_dir)
+        if user_data_dir
+        else Path(str(install["user_data_dir"]))
+    )
+    profile = profile_name or str(install.get("profile_name") or "Default")
     command = [
         str(install["executable"]),
-        f"--user-data-dir={install['user_data_dir']}",
-        f"--profile-directory={install['profile_name']}",
+        f"--user-data-dir={profile_dir}",
+        f"--profile-directory={profile}",
         f"--disable-extensions-except={extension_dir}",
         f"--load-extension={extension_dir}",
         "--no-first-run",
@@ -1925,17 +2326,177 @@ def launch_browser_with_bridge(install: dict, extension_dir: Path, url: str) -> 
         "--disable-features=msEdgeStartupBoost",
         "--extensions-not-webstore",
         "--hide-crash-restore-bubble",
-        "--start-maximized",
-        "--new-window",
-        url,
     ]
-    arguments = subprocess.list2cmdline(command[1:])
-    os.startfile(
-        str(install["executable"]),
-        operation="open",
-        arguments=arguments,
-        cwd=str(APP_BASE_DIR),
+    if headless:
+        command += [
+            "--headless=new",
+            "--disable-gpu",
+            "--mute-audio",
+            "--window-size=1440,1000",
+        ]
+    elif offscreen:
+        command += [
+            "--window-position=-32000,-32000",
+            "--window-size=1440,1000",
+        ]
+    else:
+        command += ["--start-maximized", "--new-window"]
+    command.append(url)
+    try:
+        return subprocess.Popen(
+            command,
+            cwd=str(APP_BASE_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        raise DouyinError(
+            "无法启动本机浏览器。请确认 Edge/Chrome 可以正常打开。",
+            detail=str(exc)[:300],
+        ) from exc
+
+
+def cleanup_dir_later(path: Optional[Path]) -> None:
+    if not path:
+        return
+
+    def worker() -> None:
+        for _ in range(4):
+            shutil.rmtree(path, ignore_errors=True)
+            if not Path(path).exists():
+                return
+            time.sleep(0.4)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def capture_browser_media(
+    install: dict,
+    url: str,
+    *,
+    platform: str = "",
+    headless: bool = True,
+    offscreen: bool = False,
+    user_data_dir: Optional[Path] = None,
+    profile_name: str = "",
+    timeout: float = BROWSER_VIDEO_TIMEOUT,
+    cancel_event: Optional[threading.Event] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    kill_profile: bool = False,
+) -> dict:
+    """Open one page in a hidden browser and return what the page loaded.
+
+    The helper extension captures the page's own API responses, so this works
+    for single-video pages whose data is fetched by JavaScript.
+    """
+    def log(message: str) -> None:
+        if on_log:
+            try:
+                on_log(message)
+            except Exception:
+                pass
+        LOGGER.info(message)
+
+    bridge = BrowserBridgeServer()
+    bridge.start()
+    extension_dir = create_browser_bridge_extension(
+        bridge.port, bilibili_auto_page=False
     )
+    proc: Optional[subprocess.Popen] = None
+    started = time.monotonic()
+    connected = False
+    try:
+        for attempt in range(1, 3):
+            if kill_profile and user_data_dir:
+                prepare_browser_profile(user_data_dir)
+            bridge.reset_launch_state()
+            log(
+                "正在打开后台读取窗口…" if headless
+                else "正在打开浏览器…"
+            )
+            proc = launch_browser_with_bridge(
+                install,
+                extension_dir,
+                url,
+                headless=headless,
+                offscreen=offscreen,
+                user_data_dir=user_data_dir,
+                profile_name=profile_name,
+            )
+            ready_deadline = time.monotonic() + min(20.0, timeout)
+            while time.monotonic() < ready_deadline:
+                if cancel_event and cancel_event.is_set():
+                    raise CancelledError("操作已取消")
+                progress = bridge.progress_snapshot()
+                if progress["extension_ready"] and progress["bridge_ready"]:
+                    connected = True
+                    log(
+                        "页面已连接："
+                        + str(progress.get("page_url") or "")[:90]
+                    )
+                    break
+                time.sleep(0.15)
+            if connected:
+                break
+            log("页面没有连接，正在重试…")
+            terminate_browser_process(
+                proc,
+                profile_dir=user_data_dir if kill_profile else None,
+                kill_profile=kill_profile,
+            )
+            proc = None
+        if not connected:
+            log("页面读取失败：浏览器没有连接到页面。")
+            return {
+                "items": [],
+                "cookies": [],
+                "page_url": "",
+                "page_title": "",
+                "page_text": "",
+                "page_video_src": "",
+            }
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cancel_event and cancel_event.is_set():
+                raise CancelledError("操作已取消")
+            progress = bridge.progress_snapshot()
+            if progress["items"]:
+                time.sleep(0.5)
+                break
+            if (
+                progress["page_video_src"]
+                and time.monotonic() - started >= BROWSER_VIDEO_MIN_WAIT
+            ):
+                time.sleep(0.3)
+                break
+            time.sleep(0.2)
+        items, cookies, _ready, _more = bridge.snapshot()
+        progress = bridge.progress_snapshot()
+        log(
+            f"页面读取结果：{len(items)} 条作品，"
+            f"视频地址 {'有' if progress.get('page_video_src') else '无'}。"
+        )
+        return {
+            "items": items,
+            "cookies": cookies,
+            "page_url": progress.get("page_url", ""),
+            "page_title": progress.get("page_title", ""),
+            "page_text": progress.get("page_text", ""),
+            "page_video_src": progress.get("page_video_src", ""),
+        }
+    finally:
+        terminate_browser_process(
+            proc,
+            profile_dir=user_data_dir if kill_profile else None,
+            kill_profile=kill_profile,
+        )
+        bridge.stop()
+        try:
+            shutil.rmtree(extension_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def prepare_output_dir(raw: str) -> tuple[Path, bool]:
@@ -2111,6 +2672,37 @@ class BilibiliVideoRef:
     @property
     def key(self) -> str:
         return f"{self.bvid or ('av' + self.aid) or self.url}|{self.page_number}"
+
+
+@dataclass
+class VideoLinkRef:
+    """One parsed single-video link from Douyin, Kuaishou or Bilibili."""
+
+    platform: str
+    url: str = ""
+    video_id: str = ""
+    page: int = 0
+    short_url: bool = False
+    raw: str = ""
+    kind: str = "video"
+
+    @property
+    def label(self) -> str:
+        name = PLATFORM_LABELS.get(self.platform, self.platform)
+        base = self.video_id or self.url or self.raw or "短链接"
+        if self.short_url and not self.video_id:
+            base = "短链接"
+        if self.page > 1:
+            return f"{name} {base} P{self.page}"
+        return f"{name} {base}"
+
+    @property
+    def page_number(self) -> int:
+        return self.page if self.page > 0 else 1
+
+    @property
+    def key(self) -> str:
+        return f"{self.platform}:{self.video_id or self.url}|{self.page_number}"
 
 
 class HttpClient:
@@ -2337,6 +2929,7 @@ class DouyinClient:
         self.cancel_event = cancel_event
         self.last_browser_cookie = ""
         self.last_browser_user_agent = ""
+        self._kuaishou_warmed = False
 
     def _cancelled(self) -> bool:
         event = self.cancel_event
@@ -2964,6 +3557,380 @@ class DouyinClient:
         return user, videos
 
     @staticmethod
+    def _apollo_state(html: str) -> Optional[dict]:
+        marker = "__APOLLO_STATE__="
+        text = str(html or "")
+        index = text.find(marker)
+        if index < 0:
+            return None
+        raw = text[index + len(marker):].lstrip()
+        depth = 0
+        in_string = False
+        escaped = False
+        end = 0
+        for position, char in enumerate(raw):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = position + 1
+                    break
+        if not end:
+            return None
+        try:
+            state = json.loads(raw[:end])
+        except (ValueError, TypeError):
+            return None
+        return state if isinstance(state, dict) else None
+
+    @staticmethod
+    def _find_kuaishou_photo(state: Any) -> Optional[dict]:
+        for obj in _walk(state):
+            if not isinstance(obj, dict):
+                continue
+            photo_id = obj.get("id") or obj.get("photoId")
+            if photo_id and (
+                obj.get("photoUrl") or obj.get("photoH265Url")
+                or obj.get("srcNoMark")
+            ):
+                return obj
+        return None
+
+    def resolve_kuaishou_video_link(
+        self,
+        ref: "VideoLinkRef",
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> VideoMeta:
+        """Resolve a Kuaishou single-video page through its embedded state."""
+        url = ref.url or (
+            f"https://www.kuaishou.com/short-video/{ref.video_id}"
+        )
+        headers = {
+            "Referer": "https://www.kuaishou.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        if not self._kuaishou_warmed:
+            try:
+                self.http.request("https://www.kuaishou.com/", headers=headers)
+            except DouyinError:
+                pass
+            self._kuaishou_warmed = True
+        response = self.http.request(url, headers=headers)
+        final_url = str(response.final_url or url)
+        page_id = ref.video_id
+        match = KUAISHOU_VIDEO_RE.search(final_url)
+        if match:
+            page_id = match.group(1)
+        if ref.short_url and page_id == ref.video_id:
+            raise DouyinError(
+                f"快手短链接没有跳转到视频页：{ref.raw or ref.label}"
+            )
+        state = self._apollo_state(response.text)
+        photo = self._find_kuaishou_photo(state) if state else None
+        if not photo:
+            raise DouyinError(
+                "快手页面没有返回视频数据（可能需要登录或完成验证）。"
+            )
+        if page_id and not photo.get("id"):
+            photo["id"] = page_id
+        video = self.parse_kuaishou_item(photo)
+        if not video:
+            raise DouyinError("快手视频缺少播放地址，可能已删除或受限。")
+        if on_log:
+            self._notify_log(on_log, f"  ✓ {video.desc[:50]}")
+        return video
+
+    @staticmethod
+    def _video_from_browser_page(
+        result: dict, platform: str, video_id: str = ""
+    ) -> Optional[VideoMeta]:
+        items = result.get("items") or []
+        for item in items:
+            if platform == "douyin":
+                video = DouyinClient.parse_video_item(item)
+            else:
+                video = DouyinClient.parse_kuaishou_item(item)
+            if video:
+                return video
+        source = str(result.get("page_video_src") or "")
+        if platform == "douyin" and source.startswith("http"):
+            page_url = str(result.get("page_url") or "")
+            match = AWEME_RE.search(page_url)
+            aweme_id = video_id or (match.group(1) if match else "")
+            if aweme_id:
+                title = re.sub(
+                    r"\s*-\s*抖音\s*$", "",
+                    str(result.get("page_title") or ""),
+                ).strip()
+                return VideoMeta(
+                    aweme_id=aweme_id,
+                    desc=title or f"抖音视频 {aweme_id}",
+                    create_time=int(time.time()),
+                    play_urls=[source],
+                    share_url=f"https://www.douyin.com/video/{aweme_id}",
+                    media_type="video",
+                    platform="douyin",
+                )
+        if platform == "kuaishou" and source.startswith("http"):
+            aweme_id = video_id or ""
+            if aweme_id:
+                title = str(result.get("page_title") or "").strip()
+                return VideoMeta(
+                    aweme_id=aweme_id,
+                    desc=title or f"快手视频 {aweme_id}",
+                    create_time=int(time.time()),
+                    play_urls=[source],
+                    share_url=(
+                        f"https://www.kuaishou.com/short-video/{aweme_id}"
+                    ),
+                    media_type="video",
+                    platform="kuaishou",
+                )
+        return None
+
+    def resolve_douyin_video_link(
+        self,
+        ref: "VideoLinkRef",
+        install: dict,
+        *,
+        background: bool = True,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> VideoMeta:
+        """Resolve a Douyin video link with a hidden browser."""
+        video_id = ref.video_id
+        target_url = ref.url
+        if ref.short_url or not video_id or not target_url:
+            try:
+                response = self.http.request(
+                    target_url or f"https://v.douyin.com/{video_id}",
+                    headers={"Referer": "https://www.douyin.com/"},
+                )
+                final_url = str(response.final_url or "")
+                match = AWEME_RE.search(final_url)
+                if match:
+                    video_id = match.group(1)
+                    target_url = (
+                        f"https://www.douyin.com/video/{video_id}"
+                    )
+            except DouyinError as exc:
+                if not target_url:
+                    raise DouyinError(
+                        "抖音短链接解析失败：" + exc.message.split("。")[0]
+                    ) from exc
+        if video_id and not target_url:
+            target_url = f"https://www.douyin.com/video/{video_id}"
+        if not target_url:
+            raise DouyinError(f"无法识别的抖音链接：{ref.raw or ref.label}")
+        if on_log:
+            self._notify_log(on_log, f"  正在后台打开抖音页面…")
+        result = capture_browser_media(
+            install,
+            target_url,
+            platform="douyin",
+            headless=background,
+            offscreen=not background,
+            user_data_dir=(
+                bridge_profile_dir("douyin") if background else None
+            ),
+            profile_name="Default" if background else "",
+            cancel_event=self.cancel_event,
+            on_log=on_log,
+            kill_profile=background,
+        )
+        video = self._video_from_browser_page(result, "douyin", video_id)
+        if not video:
+            page_text = str(result.get("page_text") or "")
+            hint = (
+                "页面要求登录或验证；请先在“作者作品”里用浏览器模式登录一次，"
+                "或稍后重试。"
+                if ("登录" in page_text or "验证" in page_text)
+                else "抖音页面没有返回视频数据。"
+            )
+            raise DouyinError("抖音视频解析失败：" + hint)
+        if on_log:
+            self._notify_log(on_log, f"  ✓ {video.desc[:50]}")
+        return video
+
+    def resolve_kuaishou_video_link_browser(
+        self,
+        ref: "VideoLinkRef",
+        install: dict,
+        *,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> VideoMeta:
+        """Resolve a Kuaishou video page through a logged-in hidden browser."""
+        target_url = ref.url or (
+            f"https://www.kuaishou.com/short-video/{ref.video_id}"
+        )
+        result = capture_browser_media(
+            install,
+            target_url,
+            platform="kuaishou",
+            headless=True,
+            user_data_dir=Path(str(install["user_data_dir"])),
+            profile_name=str(install.get("profile_name") or "Default"),
+            cancel_event=self.cancel_event,
+            on_log=on_log,
+            kill_profile=True,
+        )
+        video = self._video_from_browser_page(
+            result, "kuaishou", ref.video_id
+        )
+        if not video:
+            raise DouyinError(
+                "快手视频解析失败：页面可能需要登录或完成验证。"
+            )
+        if on_log:
+            self._notify_log(on_log, f"  ✓ {video.desc[:50]}")
+        return video
+
+    def fetch_videos_by_links(
+        self,
+        raw_text: str,
+        split_parts: bool = False,
+        on_log: Optional[Callable[[str], None]] = None,
+        browser_install: Optional[dict] = None,
+        restart_browser: bool = False,
+        background: bool = True,
+    ) -> tuple[UserProfile, list[VideoMeta]]:
+        """Resolve a batch of single-video links from all three platforms."""
+        refs = parse_video_links(raw_text)
+        if not refs:
+            raise DouyinError(
+                "没有识别到视频链接。支持抖音、快手、B站的视频页链接/"
+                "短链/分享文案，每行一个。"
+            )
+        if len(refs) > 200:
+            refs = refs[:200]
+            self._notify_log(
+                on_log, "一次最多解析 200 个链接，已截取前 200 个。"
+            )
+        counts = {
+            platform: sum(1 for ref in refs if ref.platform == platform)
+            for platform in PLATFORM_LABELS
+        }
+        summary = "，".join(
+            f"{PLATFORM_LABELS[name]} {count}"
+            for name, count in counts.items() if count
+        )
+        self._notify_log(
+            on_log, f"识别到 {len(refs)} 个视频链接（{summary}），开始解析…"
+        )
+        need_kuaishou_browser = counts.get("kuaishou", 0) > 0
+        if need_kuaishou_browser and browser_install is None:
+            browser_install = find_own_browser()
+        if need_kuaishou_browser and browser_install:
+            if (
+                browser_process_running(browser_install)
+                and not restart_browser
+            ):
+                raise DouyinError(
+                    "快手链接需要登录态，请先关闭本机浏览器后重试，"
+                    "或在“作者作品”中允许程序自动重启浏览器。"
+                )
+            if restart_browser:
+                close_browser_for_reuse(browser_install, log=on_log)
+
+        videos: list[VideoMeta] = []
+        failures: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for index, ref in enumerate(refs, start=1):
+            if self._cancelled():
+                raise CancelledError("操作已取消")
+            self._notify_log(
+                on_log, f"[{index}/{len(refs)}] 正在解析 {ref.label} …"
+            )
+            try:
+                if ref.platform == "bilibili":
+                    items = self.resolve_bilibili_video_link(
+                        BilibiliVideoRef(
+                            url=ref.url,
+                            bvid=(
+                                ref.video_id
+                                if ref.video_id.lower().startswith("bv")
+                                else ""
+                            ),
+                            aid=(
+                                ref.video_id[2:]
+                                if ref.video_id.lower().startswith("av")
+                                else ""
+                            ),
+                            page=ref.page,
+                            short_url=ref.short_url,
+                            raw=ref.raw,
+                        ),
+                        split_parts=split_parts,
+                        on_log=on_log,
+                    )
+                elif ref.platform == "kuaishou":
+                    if browser_install:
+                        items = [self.resolve_kuaishou_video_link_browser(
+                            ref, browser_install, on_log=on_log
+                        )]
+                    else:
+                        items = [self.resolve_kuaishou_video_link(
+                            ref, on_log=on_log
+                        )]
+                else:
+                    if not browser_install:
+                        browser_install = find_own_browser()
+                    if not browser_install:
+                        raise DouyinError(
+                            "没有找到可用的 Edge/Chrome，无法解析抖音链接。"
+                        )
+                    items = [self.resolve_douyin_video_link(
+                        ref, browser_install, background=background,
+                        on_log=on_log,
+                    )]
+            except CancelledError:
+                raise
+            except DouyinError as exc:
+                failures.append((ref.label, exc.message))
+                self._notify_log(
+                    on_log, f"  ✗ {ref.label}：{exc.message}"
+                )
+                continue
+            added = 0
+            for video in items:
+                if video.aweme_id in seen:
+                    continue
+                seen.add(video.aweme_id)
+                videos.append(video)
+                added += 1
+            if added and ref.platform == "bilibili":
+                self._notify_log(
+                    on_log,
+                    f"  ✓ {items[0].desc[:56]}"
+                    f"（{added} 条{'，作者：' + items[0].author if items[0].author else ''}）",
+                )
+        if not videos:
+            reason = failures[0][1] if failures else "没有解析到视频。"
+            raise DouyinError(reason)
+        if failures:
+            self._notify_log(
+                on_log,
+                f"有 {len(failures)} 个链接解析失败，已跳过；详情见上方日志。",
+            )
+        videos.sort(key=lambda video: video.create_time, reverse=True)
+        user = UserProfile(sec_uid="video-links", nickname="视频链接")
+        self._notify_log(
+            on_log, f"链接解析完成，共 {len(videos)} 条视频。"
+        )
+        return user, videos
+
+    @staticmethod
     def parse_bilibili_item(item: Any) -> Optional[VideoMeta]:
         if not isinstance(item, dict):
             return None
@@ -3275,6 +4242,7 @@ class DouyinClient:
         restart_browser: bool = False,
         platform_choice: str = "auto",
         bilibili_auto_page: bool = True,
+        background: bool = False,
     ) -> tuple[UserProfile, list[VideoMeta]]:
         """Read a user's posts through the real Edge/Chrome login.
 
@@ -3335,19 +4303,36 @@ class DouyinClient:
         if begin and finish and begin > finish:
             begin, finish = finish, begin
 
-        browser_was_running = browser_process_running(install)
-        if browser_was_running:
-            if not restart_browser:
-                raise DouyinError(
-                    f"本机 {install['name']} 正在运行，需要重启浏览器才能加载"
-                    "本次读取辅助组件。请允许程序自动重启浏览器后重试。"
-                )
-            close_browser_for_reuse(install, log=on_log)
+        use_temp_profile = background and platform in (
+            BROWSER_BACKGROUND_PROFILES
+        )
+        launch_profile: Optional[Path] = None
+        if use_temp_profile:
+            install = dict(install)
+            install["profile_name"] = "Default"
+            install["profile_display_name"] = "后台读取配置"
+        else:
+            browser_was_running = browser_process_running(install)
+            if browser_was_running:
+                if not restart_browser:
+                    raise DouyinError(
+                        f"本机 {install['name']} 正在运行，需要重启浏览器才能加载"
+                        "本次读取辅助组件。请允许程序自动重启浏览器后重试。"
+                    )
+                close_browser_for_reuse(install, log=on_log)
 
         bridge = BrowserBridgeServer()
         bridge.start()
+        launch_url = target_url
+        warmup_url = ""
+        if use_temp_profile:
+            if platform == "bilibili":
+                launch_url = "https://www.bilibili.com/"
+                warmup_url = target_url
         extension_dir = create_browser_bridge_extension(
-            bridge.port, bilibili_auto_page=bilibili_auto_page
+            bridge.port,
+            bilibili_auto_page=bilibili_auto_page,
+            warmup_url=warmup_url,
         )
         def log(message: str) -> None:
             if on_log:
@@ -3357,20 +4342,39 @@ class DouyinClient:
                     pass
             LOGGER.info(message)
 
-        log(
-            f"正在使用本机 {install['name']} 登录状态："
-            f"{install.get('profile_display_name') or install['profile_name']}"
-        )
+        if use_temp_profile:
+            log(
+                f"后台读取：使用 {install['name']} 的独立配置，"
+                "不会关闭你正在使用的浏览器。"
+            )
+        else:
+            log(
+                f"正在使用本机 {install['name']} 登录状态："
+                f"{install.get('profile_display_name') or install['profile_name']}"
+            )
         if direct_id:
             log(f"已从链接直接识别{label}用户，跳过资料预请求。")
         log(f"本地读取桥已启动，端口 {bridge.port}。")
 
-        def wait_for_browser(seconds: float) -> bool:
+        def wait_for_browser(
+            seconds: float, proc: Optional[subprocess.Popen] = None
+        ) -> bool:
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
                 if self.http._cancelled():
                     raise CancelledError("操作已取消")
-                if browser_process_running(install):
+                if proc is not None and proc.poll() is not None:
+                    if use_temp_profile:
+                        return bool(
+                            profile_browser_pids(
+                                install.get("user_data_dir")
+                            )
+                        )
+                    return browser_process_running(install)
+                progress = bridge.progress_snapshot()
+                if progress["extension_ready"]:
+                    return True
+                if proc is not None and proc.poll() is None:
                     return True
                 time.sleep(0.12)
             return False
@@ -3401,70 +4405,129 @@ class DouyinClient:
                 time.sleep(0.1)
             return False
 
+        if not use_temp_profile:
+            # Edge Startup Boost may respawn a background browser right after
+            # it is closed. Wait for a quiet window before launching so the
+            # command-line extension is not ignored by that process.
+            quiet_until = time.monotonic() + BROWSER_LAUNCH_QUIET_SECONDS
+            quiet_restarts = 0
+            while time.monotonic() < quiet_until:
+                if self.http._cancelled():
+                    raise CancelledError("操作已取消")
+                if browser_process_running(install):
+                    quiet_restarts += 1
+                    if quiet_restarts > 3:
+                        bridge.stop()
+                        raise DouyinError(
+                            "浏览器后台进程反复自动启动，无法加载读取组件。\n"
+                            f"请在 {install['name']} 的“设置 → 系统和性能”中"
+                            "关闭“启动加速”，完全退出浏览器后再试。"
+                        )
+                    close_browser_for_reuse(install, log=log)
+                    quiet_until = (
+                        time.monotonic() + BROWSER_LAUNCH_QUIET_SECONDS
+                    )
+                time.sleep(0.1)
+
+        launch_modes = (
+            ["headless", "offscreen", "visible"]
+            if background else ["visible"]
+        )
         launch_error = ""
         ready = False
+        proc: Optional[subprocess.Popen] = None
         try:
-            for attempt in range(1, BROWSER_LAUNCH_ATTEMPTS + 1):
-                if browser_process_running(install):
-                    close_browser_for_reuse(install, log=log)
-
-                # Edge Startup Boost may respawn a background browser right
-                # after it is closed. Wait for a quiet window before launching
-                # so the command-line extension is not ignored by that process.
-                quiet_until = time.monotonic() + BROWSER_LAUNCH_QUIET_SECONDS
-                quiet_restarts = 0
-                while time.monotonic() < quiet_until:
-                    if self.http._cancelled():
-                        raise CancelledError("操作已取消")
-                    if browser_process_running(install):
-                        quiet_restarts += 1
-                        if quiet_restarts > 3:
-                            raise DouyinError(
-                                "浏览器后台进程反复自动启动，无法加载读取组件。\n"
-                                f"请在 {install['name']} 的“设置 → 系统和性能”中"
-                                "关闭“启动加速”，完全退出浏览器后再试。"
-                            )
-                        close_browser_for_reuse(install, log=log)
-                        quiet_until = (
-                            time.monotonic() + BROWSER_LAUNCH_QUIET_SECONDS
+            for mode in launch_modes:
+                for attempt in range(1, BROWSER_LAUNCH_ATTEMPTS + 1):
+                    bridge.reset_launch_state()
+                    log(
+                        f"正在打开浏览器读取组件"
+                        f"（{mode} 模式，第 {attempt}/"
+                        f"{BROWSER_LAUNCH_ATTEMPTS} 次）…"
+                    )
+                    if not use_temp_profile and mode != "visible":
+                        close_browser_for_reuse(install, log=None)
+                    if use_temp_profile:
+                        launch_profile = bridge_profile_dir(platform)
+                        install["user_data_dir"] = launch_profile
+                    if use_temp_profile:
+                        prepare_browser_profile(install.get("user_data_dir"))
+                    try:
+                        proc = launch_browser_with_bridge(
+                            install,
+                            extension_dir,
+                            launch_url,
+                            headless=(mode == "headless"),
+                            offscreen=(mode == "offscreen"),
                         )
-                    time.sleep(0.1)
-
-                # Clear any late messages from the previous browser before
-                # verifying that the new browser loaded the helper extension.
-                bridge.reset_launch_state()
-                log(
-                    f"正在打开你的浏览器并加载本地读取组件"
-                    f"（快速读取模式，第 {attempt}/{BROWSER_LAUNCH_ATTEMPTS} 次）…"
-                )
-                try:
-                    launch_browser_with_bridge(install, extension_dir, target_url)
-                except Exception as exc:
-                    launch_error = str(exc)[:500]
-                    log(f"浏览器启动调用失败：{launch_error}")
-                    continue
-
-                if not wait_for_browser(8.0):
-                    log("浏览器启动超时，准备重新启动…")
-                    continue
-                if not wait_for_extension(BROWSER_EXTENSION_READY_TIMEOUT):
-                    log("浏览器已打开，但读取组件没有加载，正在关闭后重试…")
-                    continue
-                if not wait_for_page_bridge(BROWSER_PAGE_BRIDGE_TIMEOUT):
-                    log(f"读取组件已加载，但{label}页面没有连接，正在关闭后重试…")
-                    continue
-                ready = True
-                progress = bridge.progress_snapshot()
-                version = progress.get("extension_version") or "unknown"
-                log(f"本地读取组件已加载（v{version}），正在等待作品接口…")
-                break
+                    except Exception as exc:
+                        launch_error = str(exc)[:500]
+                        log(f"浏览器启动调用失败：{launch_error}")
+                        continue
+                    if not wait_for_browser(BROWSER_START_TIMEOUT, proc):
+                        log("浏览器启动超时，准备重新启动…")
+                        terminate_browser_process(
+                            proc,
+                            profile_dir=install.get("user_data_dir"),
+                            kill_profile=use_temp_profile or background,
+                        )
+                        proc = None
+                        continue
+                    if not wait_for_extension(BROWSER_EXTENSION_READY_TIMEOUT):
+                        log("浏览器已打开，但读取组件没有加载，正在关闭后重试…")
+                        terminate_browser_process(
+                            proc,
+                            profile_dir=install.get("user_data_dir"),
+                            kill_profile=use_temp_profile or background,
+                        )
+                        proc = None
+                        continue
+                    if not wait_for_page_bridge(BROWSER_PAGE_BRIDGE_TIMEOUT):
+                        log(
+                            f"读取组件已加载，但{label}页面没有连接，"
+                            "正在关闭后重试…"
+                        )
+                        terminate_browser_process(
+                            proc,
+                            profile_dir=install.get("user_data_dir"),
+                            kill_profile=use_temp_profile or background,
+                        )
+                        proc = None
+                        continue
+                    ready = True
+                    progress = bridge.progress_snapshot()
+                    version = progress.get("extension_version") or "unknown"
+                    log(
+                        f"本地读取组件已加载（v{version}），"
+                        "正在等待作品接口…"
+                    )
+                    break
+                if ready:
+                    break
+                if mode != launch_modes[-1]:
+                    log(f"{mode} 模式没有读取成功，自动降级重试…")
         except CancelledError:
+            terminate_browser_process(
+                proc,
+                profile_dir=install.get("user_data_dir"),
+                kill_profile=use_temp_profile or background,
+            )
             bridge.stop()
             raise
         except DouyinError:
+            terminate_browser_process(
+                proc,
+                profile_dir=install.get("user_data_dir"),
+                kill_profile=use_temp_profile or background,
+            )
             bridge.stop()
             raise
         except Exception as exc:
+            terminate_browser_process(
+                proc,
+                profile_dir=install.get("user_data_dir"),
+                kill_profile=use_temp_profile or background,
+            )
             bridge.stop()
             raise DouyinError(
                 f"无法打开本机 {install['name']}。请确认浏览器可正常启动后重试。",
@@ -3484,6 +4547,7 @@ class DouyinClient:
         last_log = started
         early_stopped = False
         last_page_seen = 0
+        reload_done = False
         if platform == "bilibili":
             if bilibili_auto_page:
                 stall_seconds = BROWSER_CAPTURE_BILIBILI_STALL_SECONDS
@@ -3498,6 +4562,15 @@ class DouyinClient:
                 if self.http._cancelled():
                     raise CancelledError("操作已取消")
                 progress = bridge.progress_snapshot()
+                if (
+                    platform == "bilibili"
+                    and not reload_done
+                    and not progress["items"]
+                    and time.monotonic() - started >= 14.0
+                ):
+                    reload_done = True
+                    bridge.request_reload()
+                    log("B站页面没有返回作品，正在刷新重试…")
                 if (
                     platform == "bilibili"
                     and max_pages > 0
@@ -3568,7 +4641,8 @@ class DouyinClient:
                             )
                         else:
                             log(
-                                f"{label}页面已连接，正在等待作品接口返回；"
+                                f"{label}页面已连接（{page_url[-48:]}），"
+                                "正在等待作品接口返回；"
                                 "如果窗口显示登录或安全验证，请直接在该窗口完成。"
                             )
                     else:
@@ -3590,6 +4664,12 @@ class DouyinClient:
                         break
                     time.sleep(0.1)
         finally:
+            if background:
+                terminate_browser_process(
+                    proc,
+                    profile_dir=install.get("user_data_dir"),
+                    kill_profile=use_temp_profile or background,
+                )
             bridge.stop()
 
         items, cookies, ready, has_more = bridge.snapshot()
@@ -3599,7 +4679,8 @@ class DouyinClient:
             if platform == "bilibili":
                 raise DouyinError(
                     "本次没有读取到B站作品。请确认浏览器中的B站空间页可以正常显示、"
-                    "已登录并完成验证；单个视频也可以切换到“视频链接”标签页直接提取。"
+                    "已登录并完成验证；单个视频也可以切换到“视频链接”标签页直接提取"
+                    "（支持抖音、快手、B站）。"
                 )
             raise DouyinError(
                 f"本次没有读取到{label}作品。请在打开的浏览器中确认已登录、"
@@ -3841,6 +4922,30 @@ class DownloadResult:
     reason: str = ""
 
 
+def find_ffmpeg() -> str:
+    """Locate a usable ffmpeg executable without making it mandatory."""
+    candidates = [
+        APP_BASE_DIR / "ffmpeg.exe",
+        APP_BASE_DIR / "ffmpeg",
+        APP_BASE_DIR / "bin" / "ffmpeg.exe",
+    ]
+    for path in candidates:
+        try:
+            if path.is_file():
+                return str(path)
+        except OSError:
+            pass
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return ""
+
+
 class Downloader:
     def __init__(
         self,
@@ -3848,11 +4953,15 @@ class Downloader:
         store: Store,
         client: HttpClient,
         progress_cb: Optional[Callable[[dict], None]] = None,
+        prefer_original: bool = False,
     ):
         self.output_dir = Path(output_dir)
         self.store = store
         self.client = client
         self.progress_cb = progress_cb
+        self.prefer_original = bool(prefer_original)
+        self.ffmpeg = find_ffmpeg()
+        self._ffmpeg_warned = False
 
     def _emit(self, event: dict) -> None:
         if self.progress_cb:
@@ -3862,6 +4971,14 @@ class Downloader:
                 pass
 
     def target_dir(self, user: UserProfile, video: VideoMeta) -> Path:
+        if str(user.sec_uid or "") in ("video-links",) or str(
+            user.sec_uid or ""
+        ).startswith("links:"):
+            label = PLATFORM_LABELS.get(
+                video.platform, video.platform or "视频"
+            )
+            author = sanitize_filename(video.author or "未知作者", 60)
+            return self.output_dir / "视频链接" / label / author / video.date_str
         return self.output_dir / user_folder_name(user) / video.date_str
 
     @staticmethod
@@ -3958,10 +5075,12 @@ class Downloader:
         })
         return DownloadResult(video, "downloaded", str(folder))
 
-    def _resolve_bilibili_play_urls(self, video: VideoMeta) -> list[str]:
+    def _bilibili_query_and_cid(
+        self, video: VideoMeta
+    ) -> tuple[dict, int]:
         aweme_id = str(video.aweme_id or "").strip()
         if not aweme_id:
-            return []
+            raise DouyinError("B站视频 ID 为空。")
         base_id = re.sub(r"_p\d+$", "", aweme_id, flags=re.I)
         query = (
             {"aid": base_id[2:]}
@@ -3996,26 +5115,36 @@ class Downloader:
             cid = _to_int(selected.get("cid"), 0) if selected else 0
             if not cid:
                 raise DouyinError("B站视频缺少分P信息，无法解析下载地址。")
+        return query, cid
+
+    def _bilibili_play_data(self, video: VideoMeta, **params) -> dict:
+        query, cid = self._bilibili_query_and_cid(video)
         play_query = urllib.parse.urlencode({
             **query,
             "cid": cid,
-            "qn": 64,
-            "fnval": 0,
-            "fnver": 0,
-            "fourk": 1,
-            "platform": "html5",
-            "high_quality": 1,
+            **params,
         })
         play = self.client.json_request(
             "https://api.bilibili.com/x/player/playurl?" + play_query,
-            headers=headers,
+            headers=dict(BILIBILI_API_HEADERS),
         )
         if not isinstance(play, dict) or _to_int(play.get("code"), 0) != 0:
             message = play.get("message") if isinstance(play, dict) else ""
             raise DouyinError(
                 "B站播放地址读取失败" + (f"：{message}" if message else "。")
             )
-        play_data = play.get("data") if isinstance(play.get("data"), dict) else {}
+        return play.get("data") if isinstance(play.get("data"), dict) else {}
+
+    def _resolve_bilibili_play_urls(self, video: VideoMeta) -> list[str]:
+        play_data = self._bilibili_play_data(
+            video,
+            qn=64,
+            fnval=0,
+            fnver=0,
+            fourk=1,
+            platform="html5",
+            high_quality=1,
+        )
         urls: list[str] = []
         for part in play_data.get("durl") or []:
             if not isinstance(part, dict):
@@ -4032,6 +5161,147 @@ class Downloader:
                 "B站没有返回可直接下载的视频流，可能需要登录或该视频受限制。"
             )
         return urls
+
+    @staticmethod
+    def _dash_stream_url(stream: dict) -> str:
+        for key in ("baseUrl", "base_url", "url"):
+            value = stream.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                return _clean_video_url(value)
+        for key in ("backupUrl", "backup_url"):
+            values = stream.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, str) and value.startswith("http"):
+                        return _clean_video_url(value)
+        return ""
+
+    def _download_bilibili_original(
+        self,
+        video: VideoMeta,
+        user: UserProfile,
+        target: Path,
+        cancel_event: Optional[threading.Event],
+    ) -> Optional[DownloadResult]:
+        """Download the clean DASH source and mux it with ffmpeg.
+
+        Returns ``None`` when the original stream is unavailable so the
+        caller can fall back to the 720P MP4.
+        """
+        ffmpeg = self.ffmpeg or find_ffmpeg()
+        if not ffmpeg:
+            return None
+        try:
+            play_data = self._bilibili_play_data(
+                video, qn=120, fnval=4048, fnver=0, fourk=1
+            )
+        except DouyinError:
+            return None
+        dash = play_data.get("dash")
+        if not isinstance(dash, dict):
+            return None
+        streams = [
+            item for item in dash.get("video") or []
+            if isinstance(item, dict)
+        ]
+        audios = [
+            item for item in dash.get("audio") or []
+            if isinstance(item, dict)
+        ]
+        if not streams or not audios:
+            return None
+        avc = [
+            item for item in streams
+            if str(item.get("codecs", "")).lower().startswith("avc1")
+        ]
+        pool = avc or streams
+        stream = max(pool, key=lambda item: _to_int(item.get("id"), 0))
+        audio = max(
+            audios, key=lambda item: _to_int(item.get("bandwidth"), 0)
+        )
+        video_url = self._dash_stream_url(stream)
+        audio_url = self._dash_stream_url(audio)
+        if not video_url or not audio_url:
+            return None
+        height = _to_int(stream.get("height"), 0)
+        self._emit({
+            "type": "note",
+            "video": video,
+            "message": (
+                f"B站原画直出：{height}P"
+                if height else "B站原画直出"
+            ),
+        })
+        part = target.with_suffix(target.suffix + ".part")
+        video_part = target.with_suffix(".video.m4s")
+        audio_part = target.with_suffix(".audio.m4s")
+        merged = target.with_suffix(".merge.mp4")
+        total_bytes = _to_int(stream.get("size"), 0) + _to_int(
+            audio.get("size"), 0
+        )
+        written = 0
+        try:
+            self._emit({
+                "type": "start", "video": video, "target": str(target),
+            })
+            for source, destination in (
+                (video_url, video_part),
+                (audio_url, audio_part),
+            ):
+                self.client.stream_to_file(
+                    source,
+                    str(destination),
+                    progress=lambda done, total, speed: self._emit({
+                        "type": "progress",
+                        "video": video,
+                        "bytes": written + done,
+                        "total": total_bytes or total,
+                        "speed": speed,
+                    }),
+                    cancel_event=cancel_event,
+                    referer="https://www.bilibili.com/",
+                )
+                written += destination.stat().st_size
+            command = [
+                ffmpeg, "-y", "-v", "error",
+                "-i", str(video_part), "-i", str(audio_part),
+                "-c", "copy", "-movflags", "+faststart", str(merged),
+            ]
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=900,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if completed.returncode != 0 or not merged.exists():
+                raise DouyinError(
+                    "ffmpeg 合并失败："
+                    + (completed.stderr or "")[-200:]
+                )
+            os.replace(merged, target)
+            self.store.write_sidecar(video, user, target)
+            self.store.mark_downloaded(video, user, target)
+            self._emit({"type": "done", "video": video, "path": str(target)})
+            return DownloadResult(video, "downloaded", str(target))
+        except CancelledError:
+            return DownloadResult(video, "cancelled", str(part), "已取消")
+        except (DouyinError, OSError, subprocess.SubprocessError) as exc:
+            self._emit({
+                "type": "note",
+                "video": video,
+                "message": "原画下载失败，改用 720P：" + str(exc)[:120],
+            })
+            return None
+        finally:
+            for path in (video_part, audio_part, merged):
+                try:
+                    if path.exists():
+                        path.unlink()
+                except OSError:
+                    pass
 
     def download_one(
         self,
@@ -4060,6 +5330,21 @@ class Downloader:
                 "path": str(target), "reason": "目标文件已存在",
             })
             return DownloadResult(video, "skipped", str(target))
+
+        if video.platform == "bilibili" and self.prefer_original:
+            if not self.ffmpeg and not self._ffmpeg_warned:
+                self._ffmpeg_warned = True
+                self._emit({
+                    "type": "note",
+                    "video": video,
+                    "message": "未找到 ffmpeg，B站将使用 720P MP4；"
+                               "安装 imageio-ffmpeg 后可下载 1080P/4K 原画。",
+                })
+            original = self._download_bilibili_original(
+                video, user, target, cancel_event
+            )
+            if original is not None:
+                return original
 
         if not video.play_urls and video.platform == "bilibili":
             try:
@@ -4173,7 +5458,7 @@ class DouyinApp:
         self.root.after(100, self._poll_events)
         self._log(
             f"应用已启动 v{APP_VERSION}。支持抖音 / 快手 / B站；"
-            "B站已支持自动翻页，也可以切到“视频链接”直接提取单个视频。"
+            "B站自动翻页、后台读取和三平台视频链接均已启用。"
         )
 
     def _restore_geometry(self) -> None:
@@ -4561,8 +5846,7 @@ class DouyinApp:
             value=bool(self.settings.get("browser_mode", True))
         )
         self._checkbutton(
-            options_row, "使用本机浏览器登录态（B站 / 快手推荐）",
-            self.browser_var,
+            options_row, "本机浏览器登录态", self.browser_var,
         ).pack(side="left")
         self.auto_page_var = tk.BooleanVar(
             value=bool(self.settings.get("bilibili_auto_page", True))
@@ -4570,15 +5854,29 @@ class DouyinApp:
         self._checkbutton(
             options_row, "B站自动翻页", self.auto_page_var,
         ).pack(side="left", padx=(16, 0))
+        self.background_var = tk.BooleanVar(
+            value=bool(self.settings.get("background_read", True))
+        )
+        self._checkbutton(
+            options_row, "后台读取（不弹窗口）", self.background_var,
+        ).pack(side="left", padx=(16, 0))
+        self.original_var = tk.BooleanVar(
+            value=bool(self.settings.get("bilibili_original", True))
+        )
+        self._checkbutton(
+            options_row, "B站原画", self.original_var,
+        ).pack(side="left", padx=(16, 0))
         tk.Label(
-            options_row, text="首次使用会自动打开 Edge / Chrome",
+            author_tab,
+            text="B站/抖音用独立配置后台读取，不关闭你正在用的浏览器；"
+                 "快手需要登录态，会先关闭一次浏览器。",
             bg=c["card"], fg=c["faint"], font=(UI_FONT, 9),
-        ).pack(side="left", padx=(14, 0))
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         links_tab.columnconfigure(0, weight=1)
         ttk.Label(
             links_tab,
-            text="支持 BV 号、av 号、视频页链接和 b23.tv 短链；"
+            text="支持抖音、快手、B站的视频链接 / 短链 / 分享文案，"
                  "可一次粘贴多条，每行一个。",
             style="Muted.TLabel",
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
@@ -4609,7 +5907,7 @@ class DouyinApp:
             value=bool(self.settings.get("bilibili_split_parts", False))
         )
         self._checkbutton(
-            links_footer, "多P视频也提取全部分P", self.split_parts_var,
+            links_footer, "B站多P提取全部分P", self.split_parts_var,
         ).pack(side="left")
         tk.Label(
             links_footer,
@@ -4991,6 +6289,7 @@ class DouyinApp:
         platform_choice = self.platform_var.get()
         selected_platform = resolve_platform(raw, platform_choice)
         use_browser = bool(self.browser_var.get())
+        background_read = bool(self.background_var.get())
         if not use_browser and selected_platform not in ("", "douyin"):
             messagebox.showerror(
                 "需要浏览器模式",
@@ -5011,26 +6310,44 @@ class DouyinApp:
                     "或取消勾选本机浏览器登录态后使用公开接口。",
                 )
                 return
-            if browser_process_running(browser_install):
+            needs_login_profile = (
+                not background_read or selected_platform == "kuaishou"
+            )
+            if browser_process_running(browser_install) and needs_login_profile:
                 if not messagebox.askyesno(
                     "需要重启浏览器",
                     f"为了直接使用你当前 {browser_install['name']} 的登录状态，"
                     "程序需要先关闭它，再用同一配置重新打开。\n\n"
-                    "浏览器通常会自动恢复上次的标签页，但未提交的网页内容可能丢失。\n\n"
-                    "现在关闭并继续吗？",
+                    + (
+                        "关闭后会在后台读取，不会显示浏览器窗口。\n\n"
+                        if background_read else
+                        "浏览器通常会自动恢复上次的标签页，"
+                        "但未提交的网页内容可能丢失。\n\n"
+                    )
+                    + "现在关闭并继续吗？",
                 ):
                     return
                 restart_browser = True
-            self._log(
-                f"将使用本机 {browser_install['name']} 登录状态："
-                f"{browser_install.get('profile_display_name') or browser_install['profile_name']}"
-            )
+            if background_read and selected_platform in (
+                "bilibili", "douyin"
+            ):
+                self._log(
+                    f"后台读取：使用 {browser_install['name']} 的独立配置，"
+                    "不会关闭你正在使用的浏览器。"
+                )
+            else:
+                self._log(
+                    f"将使用本机 {browser_install['name']} 登录状态："
+                    f"{browser_install.get('profile_display_name') or browser_install['profile_name']}"
+                )
         self.settings["date_mode"] = self.date_var.get()
         self.settings["start_date"] = self.start_var.get().strip()
         self.settings["end_date"] = self.end_var.get().strip()
         self.settings["browser_mode"] = use_browser
         self.settings["platform_mode"] = platform_choice
         self.settings["bilibili_auto_page"] = bool(self.auto_page_var.get())
+        self.settings["background_read"] = background_read
+        self.settings["bilibili_original"] = bool(self.original_var.get())
         self.store.save_settings()
         self._clear_tree()
         self.user = None
@@ -5072,6 +6389,7 @@ class DouyinApp:
                         restart_browser=restart_browser,
                         platform_choice=platform_choice,
                         bilibili_auto_page=bool(self.auto_page_var.get()),
+                        background=background_read,
                     )
                     download_cookie = client.last_browser_cookie or cookie
                 else:
@@ -5127,7 +6445,7 @@ class DouyinApp:
         if not raw:
             messagebox.showinfo(
                 "缺少链接",
-                "请粘贴至少一个B站视频链接、BV 号或 av 号。",
+                "请粘贴至少一个抖音、快手或B站的视频链接。",
             )
             return
         try:
@@ -5138,19 +6456,55 @@ class DouyinApp:
         except (ValueError, OSError) as exc:
             messagebox.showerror("输入有误", str(exc))
             return
+        refs = parse_video_links(raw)
+        if not refs:
+            messagebox.showinfo(
+                "没有识别到链接",
+                "支持抖音、快手、B站的视频页链接、短链和分享文案。",
+            )
+            return
         split_parts = bool(self.split_parts_var.get())
+        background_read = bool(self.background_var.get())
         self.settings["bilibili_split_parts"] = split_parts
+        self.settings["background_read"] = background_read
+        self.settings["bilibili_original"] = bool(self.original_var.get())
         self.store.save_settings()
         cookie = self._bilibili_cookie()
+        needs_browser = any(
+            ref.platform in ("douyin", "kuaishou") for ref in refs
+        )
+        browser_install = None
+        restart_browser = False
+        if needs_browser:
+            browser_install = find_own_browser(
+                str(self.settings.get("browser_choice", "auto"))
+            )
+            if (
+                browser_install
+                and any(ref.platform == "kuaishou" for ref in refs)
+                and browser_process_running(browser_install)
+            ):
+                if not messagebox.askyesno(
+                    "快手需要登录态",
+                    f"解析快手链接需要你的 {browser_install['name']} 登录状态，"
+                    "程序需要先关闭它，再在后台读取（不会显示窗口）。\n\n"
+                    "现在关闭并继续吗？",
+                ):
+                    return
+                restart_browser = True
         self._clear_tree()
         self.user = None
         cancel = threading.Event()
         self.cancel_event = cancel
         self._set_busy(True)
         self._set_status("正在解析视频链接…")
+        platforms = "、".join(dict.fromkeys(
+            PLATFORM_LABELS.get(ref.platform, ref.platform)
+            for ref in refs
+        ))
         self._log(
-            "开始解析B站视频链接"
-            + ("（多P视频将提取全部分P）。" if split_parts else "。")
+            f"开始解析 {len(refs)} 个视频链接（{platforms}）"
+            + ("，B站多P将提取全部分P。" if split_parts else "。")
         )
 
         def worker():
@@ -5166,14 +6520,17 @@ class DouyinApp:
                 client = DouyinClient(
                     cookie=cookie, delay=delay, cancel_event=cancel
                 )
-                user, videos = client.fetch_bilibili_videos_by_links(
+                user, videos = client.fetch_videos_by_links(
                     raw,
                     split_parts=split_parts,
                     on_log=lambda message: self.events.put({
                         "type": "log", "message": message
                     }),
+                    browser_install=browser_install,
+                    restart_browser=restart_browser,
+                    background=background_read,
                 )
-                target = output / user_folder_name(user)
+                target = output / "视频链接"
                 index_path = self.store.export_index(target, user, videos)
                 self.events.put({
                     "type": "fetch_done", "user": user, "mode": "links",
@@ -5245,6 +6602,13 @@ class DouyinApp:
                         if self.settings.get("remember_cookie") else ""
                     )
                 )
+                if any(
+                    video.platform == "bilibili" for video in videos
+                ) and not any(
+                    name in download_cookie
+                    for name in ("SESSDATA=", "bili_jct=", "DedeUserID=")
+                ):
+                    download_cookie = self._bilibili_cookie() or download_cookie
                 client = HttpClient(
                     cookie=download_cookie,
                     delay=float(self.settings.get("delay", 1.2)),
@@ -5253,6 +6617,9 @@ class DouyinApp:
                 downloader = Downloader(
                     output, self.store, client,
                     progress_cb=lambda event: self.events.put(event),
+                    prefer_original=bool(
+                        self.settings.get("bilibili_original", True)
+                    ),
                 )
                 self.events.put({
                     "type": "download_started", "total": len(videos)
@@ -5264,9 +6631,12 @@ class DouyinApp:
                     if result.status == "cancelled":
                         cancelled = True
                 try:
-                    self.store.export_index(
-                        output / user_folder_name(user), user, videos
+                    index_root = (
+                        output / "视频链接"
+                        if str(user.sec_uid or "").startswith("links:")
+                        else output / user_folder_name(user)
                     )
+                    self.store.export_index(index_root, user, videos)
                 except OSError:
                     pass
                 self.events.put({
@@ -5324,6 +6694,10 @@ class DouyinApp:
         elif kind == "retry":
             self.tree.set(iid, "status", "重试中")
             self._log(f"下载重试 {video.aweme_id}：{event.get('reason', '')}")
+        elif kind == "note":
+            message = str(event.get("message") or "")
+            if message:
+                self._log(f"{video.aweme_id}：{message}")
         elif kind in ("done", "skipped", "failed", "cancelled"):
             labels = {
                 "done": "已完成", "skipped": "已跳过",
@@ -5513,10 +6887,9 @@ class DouyinApp:
         ttk.Label(
             frame,
             text=(
-                "浏览器模式会直接使用本机 Edge/Chrome 的登录状态。"
-                "使用前需要关闭该浏览器，程序会询问是否自动重启。\n"
-                "B站作者页支持自动翻页；单个视频可以在主界面的"
-                "“视频链接”标签页里直接解析，不需要打开浏览器。"
+                "B站/抖音后台读取使用独立配置，不会关闭你正在用的浏览器；"
+                "快手需要登录态，会先关闭一次浏览器再无窗口读取。\n"
+                "B站原画需要 ffmpeg 和登录 Cookie；没有 ffmpeg 时自动退回 720P MP4。"
             ),
             style="Hint.TLabel",
             wraplength=610,
@@ -5655,7 +7028,17 @@ def run_cli(args) -> int:
         cookie=args.cookie, delay=args.delay, cancel_event=cancel
     )
     try:
-        if args.browser:
+        if args.links:
+            user, videos = client.fetch_videos_by_links(
+                args.links,
+                split_parts=args.split_parts,
+                on_log=lambda message: print("  " + message, flush=True),
+                browser_install=find_own_browser(args.browser_choice),
+                restart_browser=args.restart_browser,
+                background=not args.no_background,
+            )
+            begin, finish = None, None
+        elif args.browser:
             user, videos = client.fetch_user_videos_own_browser(
                 args.url, begin, finish, max_pages=args.max_pages,
                 on_log=lambda message: print("  " + message, flush=True),
@@ -5663,6 +7046,7 @@ def run_cli(args) -> int:
                 restart_browser=args.restart_browser,
                 platform_choice=args.platform,
                 bilibili_auto_page=not args.no_bili_auto_page,
+                background=not args.no_background,
             )
             if client.last_browser_cookie:
                 client.http.cookie = client.last_browser_cookie
@@ -5692,9 +7076,12 @@ def run_cli(args) -> int:
             f"{video.duration_text}  {video.desc[:60]}"
         )
     try:
-        index_path = store.export_index(
-            output / user_folder_name(user), user, videos
+        index_root = (
+            output / "视频链接"
+            if str(user.sec_uid or "") == "video-links"
+            else output / user_folder_name(user)
         )
+        index_path = store.export_index(index_root, user, videos)
         print(f"元数据：{index_path}")
     except OSError as exc:
         print(f"警告：元数据导出失败：{exc}", file=sys.stderr)
@@ -5702,7 +7089,10 @@ def run_cli(args) -> int:
         return 0
     if not videos:
         return 0
-    downloader = Downloader(output, store, client.http)
+    downloader = Downloader(
+        output, store, client.http,
+        prefer_original=not args.no_bili_original,
+    )
     try:
         results = downloader.download_many(videos, user, cancel)
     except KeyboardInterrupt:
@@ -5713,7 +7103,14 @@ def run_cli(args) -> int:
     skipped = sum(1 for item in results if item.status == "skipped")
     failed = sum(1 for item in results if item.status == "failed")
     print(f"\n完成：成功 {downloaded}，跳过 {skipped}，失败 {failed}")
-    print(f"目录：{output / user_folder_name(user)}")
+    print(
+        "目录："
+        + str(
+            output / "视频链接"
+            if str(user.sec_uid or "") == "video-links"
+            else output / user_folder_name(user)
+        )
+    )
     return 0 if failed == 0 else 1
 
 def build_parser() -> argparse.ArgumentParser:
@@ -5721,6 +7118,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="抖音 / 快手 / B站指定用户作品提取器"
     )
     parser.add_argument("--url", help="用户主页链接 / 分享链接 / 用户ID")
+    parser.add_argument(
+        "--links",
+        help="直接解析视频链接：抖音/快手/B站，可多行或用空格分隔",
+    )
     parser.add_argument(
         "--platform", choices=("auto", "douyin", "kuaishou", "bilibili"),
         default="auto", help="平台：auto / douyin / kuaishou / bilibili",
@@ -5750,6 +7151,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-bili-auto-page", action="store_true",
         help="B站作者页不自动翻页（默认自动点击下一页）",
+    )
+    parser.add_argument(
+        "--no-background", action="store_true",
+        help="不使用无头后台读取，显示浏览器窗口",
+    )
+    parser.add_argument(
+        "--no-bili-original", action="store_true",
+        help="B站不下载原画（默认用 ffmpeg 合并 1080P/4K）",
+    )
+    parser.add_argument(
+        "--split-parts", action="store_true",
+        help="B站多P视频提取全部分P",
     )
     parser.add_argument("--delay", type=float, default=1.2, help="请求间隔秒数")
     parser.add_argument("--gui", action="store_true", help="启动 GUI")
@@ -5804,7 +7217,8 @@ def main(argv=None) -> int:
         except Exception:
             pass
     args = build_parser().parse_args(argv)
-    if args.gui or not args.url:
+    cleanup_old_profiles()
+    if args.gui or (not args.url and not args.links):
         return run_gui()
     return run_cli(args)
 

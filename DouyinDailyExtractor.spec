@@ -1,12 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas = []
+binaries = []
+hiddenimports = ['tkinter', 'tkinter.ttk', 'tkinter.filedialog', 'tkinter.messagebox']
+tmp_ret = collect_all('imageio_ffmpeg')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['douyin_daily.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=['tkinter', 'tkinter.ttk', 'tkinter.filedialog', 'tkinter.messagebox'],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +29,6 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='DouyinDailyExtractor',
-    icon=['assets\\douyin_daily_icon.ico'],
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -33,6 +39,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['assets/douyin_daily_icon.ico'],
 )
 coll = COLLECT(
     exe,

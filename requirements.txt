@@ -1,3 +1,7 @@
-# 运行时依赖：无。
-# 本程序运行时只使用 Python 标准库，不需要执行 pip install。
-# 仅打包 exe 时需要 PyInstaller，由 build.bat 自动安装，不属于运行时依赖。
+# 运行时依赖：
+# - 程序本身只使用 Python 标准库。
+# - B站 1080P/4K 原画需要用 ffmpeg 合并 DASH 音视频：
+#     python -m pip install imageio-ffmpeg
+#   未安装时会自动退回 720P MP4，不影响其他功能。
+# - 仅打包 exe 时需要 PyInstaller，由 build.bat 自动安装。
+imageio-ffmpeg>=0.5

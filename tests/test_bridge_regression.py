@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Focused regression coverage for the browser bridge and extension contract."""
 import json
 import sys
@@ -271,6 +271,10 @@ class TestExtensionContractRegression(unittest.TestCase):
             self.assertIn("chrome.runtime.onStartup.addListener", background)
             self.assertIn("chrome.runtime.onInstalled.addListener", background)
             self.assertIn("dyGetCookies", background)
+            self.assertIn("dyBridgeData", background)
+            self.assertIn("dyGetCommand", background)
+            self.assertIn('"/data"', background)
+            self.assertIn("/command", background)
             self.assertIn("45678", background)
 
             inject = (first / "inject.js").read_text(encoding="utf-8")
@@ -286,11 +290,11 @@ class TestExtensionContractRegression(unittest.TestCase):
 
             bridge = (first / "bridge.js").read_text(encoding="utf-8")
             self.assertIn('window.addEventListener("message"', bridge)
-            self.assertIn('"/data"', bridge)
+            self.assertIn("dyBridgeData", bridge)
+            self.assertIn("dyGetCommand", bridge)
             self.assertIn("dyGetCookies", bridge)
             self.assertIn("__dyBridgeReady", bridge)
             self.assertIn("__bridgePlatform", bridge)
-            self.assertIn("/command", bridge)
             self.assertIn("stopScroll", bridge)
             self.assertIn("45678", bridge)
             self.assertNotIn("45679", bridge)

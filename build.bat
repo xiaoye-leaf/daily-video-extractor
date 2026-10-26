@@ -13,7 +13,7 @@ if not defined PY (
     pause
     exit /b 1
 )
-%PY% -m pip install --disable-pip-version-check pyinstaller
+%PY% -m pip install --disable-pip-version-check pyinstaller imageio-ffmpeg
 if errorlevel 1 (
     echo [ERROR] Failed to install build dependencies.
     pause
@@ -24,6 +24,7 @@ if errorlevel 1 (
   --icon "assets\douyin_daily_icon.ico" ^
   --hidden-import tkinter --hidden-import tkinter.ttk ^
   --hidden-import tkinter.filedialog --hidden-import tkinter.messagebox ^
+  --collect-all imageio_ffmpeg ^
   douyin_daily.py
 if errorlevel 1 (
     echo [ERROR] Build failed.

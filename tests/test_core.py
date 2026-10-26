@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Offline tests for the Douyin daily extractor. No network is used."""
 import json
@@ -261,10 +261,27 @@ class TestOwnBrowserHelpers(unittest.TestCase):
             launch_state["launched"] = False
             launch_state["closed"] = True
 
-        def fake_launch(_install, _extension, _url):
+        class FakeProc:
+            pid = 999999
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        def fake_launch(_install, _extension, _url, **_kwargs):
             launch_state["calls"] += 1
             launch_state["launched"] = True
             launch_state["closed"] = False
+            return FakeProc()
 
         logs = []
         with tempfile.TemporaryDirectory() as td:
@@ -278,6 +295,7 @@ class TestOwnBrowserHelpers(unittest.TestCase):
                     mock.patch.object(d, "browser_process_running",
                                       side_effect=fake_running), \
                     mock.patch.object(d, "BROWSER_LAUNCH_QUIET_SECONDS", 0.01), \
+                    mock.patch.object(d, "BROWSER_START_TIMEOUT", 0.05), \
                     mock.patch.object(d, "BROWSER_EXTENSION_READY_TIMEOUT", 0.05):
                 client = d.DouyinClient()
                 user, videos = client.fetch_user_videos_own_browser(
@@ -345,6 +363,22 @@ class TestOwnBrowserHelpers(unittest.TestCase):
 
         logs = []
 
+        class FakeProc:
+            pid = 999999
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
         def fake_running(_install):
             if not close_browser.called:
                 return True
@@ -357,7 +391,10 @@ class TestOwnBrowserHelpers(unittest.TestCase):
                     mock.patch.object(d, "create_browser_bridge_extension",
                                       return_value=Path(td)), \
                     mock.patch.object(d, "close_browser_for_reuse") as close_browser, \
-                    mock.patch.object(d, "launch_browser_with_bridge") as launch, \
+                    mock.patch.object(
+                        d, "launch_browser_with_bridge",
+                        return_value=FakeProc(),
+                    ) as launch, \
                     mock.patch.object(d, "browser_process_running",
                                       side_effect=fake_running):
                 client = d.DouyinClient()
